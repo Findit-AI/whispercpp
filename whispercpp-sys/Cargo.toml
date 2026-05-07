@@ -1,0 +1,67 @@
+[package]
+name        = "whispercpp-sys"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+readme = "README.md"
+description = "Low-level Rust FFI bindings to whisper.cpp. Cmake-builds a patched fork that closes upstream OOM / UB / leak hazards reachable from safe Rust."
+keywords    = ["whisper", "ffi", "bindings", "asr", "speech-to-text"]
+categories  = ["external-ffi-bindings", "multimedia::audio", "science"]
+links       = "whisper"
+
+[lib]
+name = "whispercpp_sys"
+path = "src/lib.rs"
+
+[features]
+# Default to a CPU build — no GPU dep pulled. The `whispercpp`
+# safe wrapper turns Metal/CoreML on by default via its own
+# feature defaults; this crate stays minimal so servers / CI
+# runners that build `--no-default-features` get a fast
+# plain-CPU compile.
+#
+# whisper.cpp is **always** built from the vendored submodule
+# (`whisper.cpp/`, pinned to a patched fork branch). There is
+# no pkg-config / system-install path: routing safe Rust code
+# through a stock libwhisper would silently lose the
+# memory-safety guarantees the bundled patches provide.
+default = []
+
+# Backend feature flags map 1:1 to whisper.cpp/ggml CMake
+# options. Each feature toggles the matching `-DGGML_*=ON`
+# (or `-DWHISPER_*=ON`) flag plus the link directives for the
+# static library cmake produces and any system framework /
+# library it depends on.
+#
+# Apple-only:
+metal    = []  # GGML_METAL: Metal GPU encoder/decoder
+coreml   = []  # WHISPER_COREML: CoreML encoder dispatch (ANE)
+# Cross-platform GPU:
+vulkan   = []  # GGML_VULKAN: Vulkan compute (Linux/Win/Android)
+opencl   = []  # GGML_OPENCL: OpenCL (mobile GPUs, Adreno)
+# Vendor-specific GPU:
+cuda     = []  # GGML_CUDA: NVIDIA CUDA
+hipblas  = []  # GGML_HIP: AMD ROCm/HIP (formerly GGML_HIPBLAS)
+sycl     = []  # GGML_SYCL: Intel oneAPI / Arc GPUs
+musa     = []  # GGML_MUSA: Moore Threads MUSA
+# Encoder accelerators (similar role to CoreML, but other vendors):
+openvino = []  # WHISPER_OPENVINO: Intel OpenVINO encoder
+# CPU-side BLAS:
+openblas = []  # GGML_BLAS=ON, GGML_BLAS_VENDOR=OpenBLAS
+
+[build-dependencies]
+# `cmake` drives the bundled whisper.cpp build.
+cmake   = "0.1"
+# `bindgen` generates Rust FFI for whisper.h + the shim
+# header. Output lands in `OUT_DIR/generated.rs` so the
+# source tree stays read-only for cargo vendor / Nix builds.
+bindgen = "0.72"
+# `cc` compiles `whispercpp_shim.cpp` into a tiny static lib
+# that catches C++ exceptions before they unwind across the
+# `extern "C"` boundary into Rust.
+cc = "1"
+
+[lints]
+workspace = true

@@ -1,0 +1,4 @@
+# Per-crate cargo target dir (whisper-cpp uses its own
+# workspace declaration so cargo writes here rather than
+# alongside whispery's main target/).
+target/

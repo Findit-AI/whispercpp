@@ -2,343 +2,359 @@ name: CI
 
 on:
   push:
-    branches:
-      - main
+    branches: 
+      - 'main'
     paths-ignore:
-      - 'README'
+      - 'README*'
       - 'COPYRIGHT'
       - 'LICENSE-*'
       - '**.md'
       - '**.txt'
   pull_request:
     paths-ignore:
-      - 'README'
+      - 'README*'
       - 'COPYRIGHT'
       - 'LICENSE-*'
       - '**.md'
       - '**.txt'
   workflow_dispatch:
-  schedule: [cron: "0 1 */7 * *"]
+  schedule: 
+    - cron: "0 1 1 * *"
 
 env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: -Dwarnings
   RUST_BACKTRACE: 1
 
+# Notes on the matrix
+# -------------------
+# `whispercpp-sys` invokes cmake on the bundled `whisper.cpp/`
+# submodule and emits link directives for the resulting static
+# libraries. Three consequences for CI:
+#
+# * Every checkout that builds the bundled crate MUST set
+#   `submodules: recursive`. The default
+#   `actions/checkout@v6` strips them, leaving build.rs to fail
+#   at the cmake step with a missing `CMakeLists.txt`.
+# * Cross-compilation to wasm / mobile / niche-arch targets
+#   cannot drive cmake against a vendored C++ tree without
+#   per-target sysroot work. We pin the supported matrix to
+#   ubuntu / macos x86_64+aarch64 / windows.
+# * GPU backends (cuda / hipblas / sycl / vulkan / opencl /
+#   musa / openvino) all need vendor SDKs not present on
+#   GitHub-hosted runners. CI exercises `bundled` (CPU) and,
+#   on macOS only, `metal,coreml`.
+#
+# Safety gates layered:
+#
+# * `rustfmt` / `clippy`  — style + lint floor (deny-warnings)
+# * `build-bundled`       — the bundled CMake link path on
+#                           ubuntu/macos/windows
+# * `build-macos-gpu`     — Apple Silicon Metal + CoreML link
+# * `test`                — `cargo test --lib` on linux/macos
+# * `sanitizer`           — Linux ASan + UBSan against the
+#                           bundled FFI smoke test (the
+#                           safety surface that flashed under
+#                           every codex round). 
+#                           reinstated this after an earlier
+#                           refactor accidentally dropped it.
+# * `miri`                — Miri on the safe wrapper crate's
+#                           tests. Skipped FFI-touching tests
+#                           via cfg(miri); covers the safe
+#                           Rust invariants (atomic ordering
+#                           on Context poison flag, drop
+#                           order, lang serde, etc.).
+# * `doc`                 — rustdoc -Dwarnings
+
 jobs:
-  # Check formatting (platform-independent, one OS is enough)
   rustfmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
-    - name: Install Rust
-      run: rustup update stable && rustup default stable && rustup component add rustfmt
-    - name: Check formatting
-      run: cargo fmt --all -- --check
+      - uses: actions/checkout@v6
+      - run: rustup update stable && rustup default stable && rustup component add rustfmt
+      - run: cargo fmt --all -- --check
 
-  # Apply clippy lints
   clippy:
     name: clippy
     strategy:
+      fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
-    - name: Install Rust
-      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
-      run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
-    - name: Apply clippy lints
-      run: cargo hack clippy --each-feature --exclude-no-default-features
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: rustup update stable && rustup default stable && rustup component add clippy
+      - run: cargo clippy --workspace --all-targets
 
-  # Run tests on some extra platforms
-  cross:
-    name: cross
+  build-bundled:
+    name: build (bundled CPU) on ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        target:
-          - aarch64-unknown-linux-gnu
-          - aarch64-linux-android
-          - aarch64-unknown-linux-musl
-          - i686-linux-android
-          - x86_64-linux-android
-          - i686-pc-windows-gnu
-          - x86_64-pc-windows-gnu
-          - i686-unknown-linux-gnu
-          - powerpc64-unknown-linux-gnu
-          - riscv64gc-unknown-linux-gnu
-          - wasm32-unknown-unknown
-          - wasm32-unknown-emscripten
-          - wasm32-wasip1
-          - wasm32-wasip1-threads
-          - wasm32-wasip2
-    runs-on: ubuntu-latest
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
+        with:
+          submodules: recursive
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cross-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cross-
-      - name: Install Rust
-        run: rustup update stable && rustup default stable
-      - name: cargo build --target ${{ matrix.target }}
-        run: |
-          rustup target add ${{ matrix.target }}
-          cargo build --target ${{ matrix.target }}
+          key: ${{ runner.os }}-build-bundled-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-build-bundled-
+      - run: rustup update stable --no-self-update && rustup default stable
+      - run: cargo build -p whispercpp -p whispercpp-sys
 
-  build:
-    name: build
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
+  build-macos-gpu:
+    name: build (metal + coreml)
+    runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v6
-    - name: Cache cargo build and registry
-      uses: actions/cache@v5
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-build-
-    - name: Install Rust
-      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
-      run: rustup update stable --no-self-update && rustup default stable
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
-    - name: Run build
-      run: cargo hack build --feature-powerset --exclude-no-default-features
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-gpu-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: macos-gpu-
+      - run: rustup update stable && rustup default stable
+      - run: cargo build -p whispercpp --features metal,coreml,serde
 
   test:
-    name: test
+    name: test on ${{ matrix.os }}
     strategy:
+      fail-fast: false
       matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
+        os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
-    - name: Cache cargo build and registry
-      uses: actions/cache@v5
-      with:
-        path: |
-          ~/.cargo/registry
-          ~/.cargo/git
-          target
-        key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
-        restore-keys: |
-          ${{ runner.os }}-test-
-    - name: Install Rust
-      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
-      run: rustup update stable --no-self-update && rustup default stable
-    - name: Install cargo-hack
-      run: cargo install cargo-hack
-    - name: Run test
-      run: cargo hack test --feature-powerset --exclude-no-default-features --exclude-features loom
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-test-
+      - run: rustup update stable && rustup default stable
+      - run: cargo test -p whispercpp --features serde --lib
+
+  doc:
+    name: doc
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - run: rustup update stable && rustup default stable
+      - run: cargo doc --workspace --no-deps --features whispercpp/serde
+        env:
+          RUSTDOCFLAGS: -Dwarnings
 
   sanitizer:
-    name: sanitizer
+    name: sanitizer (asan)
     runs-on: ubuntu-latest
+    env:
+      # Unset the workspace deny-warnings while Sanitizer
+      # builds the C++ tree — ggml's CMake emits warnings
+      # under sanitizer flags that are not actionable from
+      # this crate.
+      RUSTFLAGS: ""
     steps:
       - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
+        with:
+          submodules: recursive
+      - uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-sanitizer-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-sanitizer-
-      - name: Install Rust
-        run: rustup update nightly && rustup default nightly
-      - name: Install rust-src
-        run: rustup component add rust-src
-      - name: ASAN / LSAN / MSAN / TSAN
-        run: bash ci/sanitizer.sh
-
-  miri-tb:
-    name: miri-tb-${{ matrix.target }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: i686-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: powerpc64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: s390x-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-miri-
-      - name: Miri
+          key: ubuntu-sanitizer-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-sanitizer-
+      # The Rust sanitizer support requires nightly.
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - run: rustup default nightly
+      # AddressSanitizer compiled into both the Rust crate and
+      # the vendored C++ via `-Zsanitizer=address` plus
+      # `-Zbuild-std`. We build *only* the bundled CPU path;
+      # GPU backends pull in vendor SDKs that bring their own
+      # UB into scope and aren't worth adjudicating here.
+      - name: cargo test (asan)
         run: |
-          bash ci/miri_tb.sh "${{ matrix.target }}"
-
-  miri-sb:
-    name: miri-sb-${{ matrix.target }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: i686-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: powerpc64-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: s390x-unknown-linux-gnu
-          - os: ubuntu-latest
-            target: riscv64gc-unknown-linux-gnu
-          - os: macos-latest
-            target: aarch64-apple-darwin
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-miri-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-miri-
-      - name: Miri
-        run: |
-          bash ci/miri_sb.sh "${{ matrix.target }}"
-
-  loom:
-    name: loom
-    strategy:
-      matrix:
-        os:
-          - ubuntu-latest
-          - macos-latest
-          - windows-latest
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-loom-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-loom-
-      - name: Install Rust
-        run: rustup update nightly --no-self-update && rustup default nightly
-      - name: Loom tests
-        run: cargo test --tests --features loom
-
-  # valgrind:
-  #   name: valgrind
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - uses: actions/checkout@v6
-  #     - name: Cache cargo build and registry
-  #       uses: actions/cache@v5
-  #       with:
-  #         path: |
-  #           ~/.cargo/registry
-  #           ~/.cargo/git
-  #           target
-  #         key: ubuntu-latest-valgrind-${{ hashFiles('**/Cargo.lock') }}
-  #         restore-keys: |
-  #           ubuntu-latest-valgrind-
-  #     - name: Install Rust
-  #       run: rustup update stable && rustup default stable
-  #     - name: Install Valgrind
-  #       run: |
-  #         sudo apt-get update -y
-  #         sudo apt-get install -y valgrind
-  #     # Uncomment and customize when you have binaries to test:
-  #     # - name: cargo build foo
-  #     #   run: cargo build --bin foo
-  #     #   working-directory: integration
-  #     # - name: Run valgrind foo
-  #     #   run: valgrind --error-exitcode=1 --leak-check=full --show-leak-kinds=all ./target/debug/foo
-  #     #   working-directory: integration
-
-  coverage:
-    name: coverage
-    runs-on: ubuntu-latest
-    needs:
-      - rustfmt
-      - clippy
-      - build
-      - cross
-      - test
-      - sanitizer
-      - loom
-    steps:
-      - uses: actions/checkout@v6
-      - name: Install Rust
-        run: rustup update nightly && rustup default nightly
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
-      - name: Cache cargo build and registry
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-coverage-
-      - name: Run tarpaulin
+          export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
+          cargo +nightly test \
+            -p whispercpp \
+            --features serde \
+            --lib \
+            -Zbuild-std \
+            --target x86_64-unknown-linux-gnu \
+            -- --test-threads 1
         env:
-          RUSTFLAGS: "--cfg tarpaulin"
-        run: cargo tarpaulin --all-features --run-types tests --run-types doctests --workspace --out xml
-      - name: Upload to codecov.io
-        uses: codecov/codecov-action@v6
+          RUSTFLAGS: "-Zsanitizer=address"
+          # ASan ignores detect_leaks because the static-init
+          # paths in libstdc++ / ggml's TLS logger have benign
+          # one-shot leaks at init time. The leak surface we
+          # actually care about (post-throw state cleanup) is
+          # exercised by the test suite, not by ASan's leak
+          # tracker.
+
+  ubsan:
+    name: ubsan (C++ side)
+    runs-on: ubuntu-latest
+    # rustc has no `-Zsanitizer=undefined` pass; UBSan in this
+    # crate's threat model lives on the C++ side (whisper.cpp +
+    # ggml + the shim). We pass `-fsanitize=undefined` to the
+    # C++ compiler via `CFLAGS` / `CXXFLAGS` / `LDFLAGS` and run
+    # the test suite. cmake-rs forwards these env vars to the
+    # CMake invocation; `cc::Build` (used for the shim) honors
+    # them too. Stable Rust is enough — no `-Zbuild-std` needed
+    # because the sanitizer lives entirely in the C++ link.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v6
         with:
-          token: ${{ secrets.CODECOV_TOKEN }}
-          slug: ${{ github.repository }}
-          fail_ci_if_error: true
+          submodules: recursive
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-ubsan-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-ubsan-
+      - run: rustup update stable && rustup default stable
+      - name: cargo test (ubsan, C++)
+        run: |
+          # `halt_on_error=1` + `abort_on_error=1` makes UBSan
+          # terminate the process on the first hit (equivalent
+          # to `-fno-sanitize-recover=all` at the runtime level
+          # but using the recovering handlers `__ubsan_handle_*`
+          # that are always present in libubsan, instead of the
+          # `_abort` variants that need an extra runtime).
+          # `print_stacktrace=1` makes triage easier when CI
+          # does fire.
+          export UBSAN_OPTIONS="halt_on_error=1:abort_on_error=1:print_stacktrace=1"
+          cargo test \
+            -p whispercpp \
+            --features serde \
+            --lib \
+            -- --test-threads 1
+        env:
+          # Instrument the C++ side with UBSan. Recovering form
+          # (NOT `-fno-sanitize-recover=all`) — see the
+          # UBSAN_OPTIONS comment above.
+          CFLAGS:   "-fsanitize=undefined"
+          CXXFLAGS: "-fsanitize=undefined"
+          LDFLAGS:  "-fsanitize=undefined"
+          # rustc invokes the linker with `-nodefaultlibs`,
+          # which suppresses gcc's normal libubsan auto-
+          # injection despite `-fsanitize=undefined` being on
+          # the link command. We add `-lubsan` explicitly,
+          # wrapped in `--no-as-needed` so the linker can't
+          # discard it before the C++ rlibs that reference
+          # `__ubsan_handle_*` get scanned.
+          RUSTFLAGS: "-Clink-arg=-Wl,--no-as-needed -Clink-arg=-lubsan -Clink-arg=-Wl,--as-needed"
+
+  sanitizer-aarch64:
+    name: sanitizer (asan, aarch64-linux)
+    runs-on: ubuntu-24.04-arm
+    # AddressSanitizer on aarch64 catches arch-specific bugs
+    # (alignment, atomic ordering, intrinsic codegen) that the
+    # x86_64 ASan job can miss.
+    #
+    # We initially targeted HWAddressSanitizer here for its
+    # cheaper memory overhead, but `-Zsanitizer=hwaddress` +
+    # `+tagged-globals` produces ADRP relocations against
+    # `compiler_builtins`'s outline-atomics dispatcher whose
+    # tagged-section addresses are out of range for any
+    # currently-shipping linker (bfd, gold, lld all hit
+    # `R_AARCH64_ADR_PREL_PG_HI21 out of range`). That's a
+    # known rustc / compiler_builtins / HWASan incompatibility
+    # specific to aarch64 outline atomics; ASan side-steps it
+    # entirely.
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: aarch64-asan-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: aarch64-asan-
+      - run: rustup toolchain install nightly --profile minimal --component rust-src
+      - run: rustup default nightly
+      - name: cargo test (asan, aarch64)
+        run: |
+          export ASAN_OPTIONS=detect_leaks=0:abort_on_error=1
+          cargo +nightly test \
+            -p whispercpp \
+            --features serde \
+            --lib \
+            -Zbuild-std \
+            --target aarch64-unknown-linux-gnu \
+            -- --test-threads 1
+        env:
+          RUSTFLAGS: "-Zsanitizer=address"
+
+  miri:
+    name: miri (safe wrapper)
+    runs-on: ubuntu-latest
+    env:
+      RUSTFLAGS: ""
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+      - uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ubuntu-miri-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ubuntu-miri-
+      - run: rustup toolchain install nightly --profile minimal --component miri
+      - run: rustup default nightly
+      # Miri does not support FFI / cmake-built C++. Tag
+      # FFI-touching tests with #[cfg_attr(miri, ignore)]
+      # in source. The remaining tests cover:
+      #
+      # * `params.rs`: clamp helpers, set_n_threads_unchecked
+      #   bypass, beam-size + best-of bypass, default param
+      #   normalisation
+      # * `context.rs`: AtomicBool poisoning visibility
+      #   across threads, full_lock serialisation
+      # * `lang.rs`: serde round-trips, canonicalisation
+      #
+      # That's the surface where we have new unsafe code
+      # (the AbortCallback typedef + UnsafeCell trampoline
+      # storage). Miri verifies the Rust invariants there
+      # without ever entering the FFI. Useful for catching
+      # aliasing / strict-provenance / drop-order regressions.
+      - name: cargo miri test (safe wrapper, FFI tests skipped)
+        run: |
+          cargo +nightly miri test \
+            -p whispercpp \
+            --features serde \
+            --lib
+        env:
+          MIRIFLAGS: "-Zmiri-strict-provenance -Zmiri-symbolic-alignment-check"
