@@ -10,6 +10,15 @@ description = "Safe Rust bindings for whisper.cpp speech recognition. Bundled pa
 keywords    = ["whisper", "asr", "speech-to-text", "transcription", "audio"]
 categories  = ["multimedia::audio", "api-bindings", "science"]
 
+# docs.rs configuration. Backend features (metal/coreml/vulkan/cuda/...)
+# gate the C++ build, not any Rust API surface, AND docs.rs's Linux build
+# farm has none of the vendor SDKs they require, so `all-features = true`
+# would fail. We enable `serde` so the `Lang` Serialize/Deserialize impls
+# show up in the rendered docs.
+[package.metadata.docs.rs]
+features = ["serde"]
+rustdoc-args = ["--cfg", "docsrs"]
+
 [lib]
 name = "whispercpp"
 path = "src/lib.rs"
