@@ -1,0 +1,96 @@
+[package]
+name        = "whispercpp"
+version     = "0.1.0"
+edition.workspace      = true
+rust-version.workspace = true
+license.workspace      = true
+repository.workspace   = true
+readme = "README.md"
+description = "Safe Rust bindings for whisper.cpp speech recognition. Bundled patched build with memory-safety hardening, exception-catching FFI shim, and Send + Sync types."
+keywords    = ["whisper", "asr", "speech-to-text", "transcription", "audio"]
+categories  = ["multimedia::audio", "api-bindings", "science"]
+
+[lib]
+name = "whispercpp"
+path = "src/lib.rs"
+
+[features]
+# Default: CPU build (no GPU dep). `cargo add whispercpp` Just
+# Works on every platform (Apple, Linux, Windows) without a
+# preinstalled whisper.cpp — but ships ZERO GPU acceleration.
+# Opt into GPU backends explicitly per-target via the feature
+# flags below; multi-platform consumers can document which
+# accelerator each target needs in their own `Cargo.toml`
+# rather than silently inheriting an Apple-Silicon-only set.
+#
+# whisper.cpp is **always** built from the vendored submodule
+# in `whispercpp-sys/whisper.cpp/` and patched in `OUT_DIR`.
+# There is no system / pkg-config path: routing safe-Rust
+# code through a stock unpatched libwhisper would silently
+# drop the memory-safety guarantees the bundled patches
+# provide.
+default = []
+
+# Enables `serde::{Serialize, Deserialize}` for `Lang`. The
+# wire format is the lowercase ISO-639-1 string ("en", "yue",
+# etc.) — see `Lang`'s impls.
+serde = ["dep:serde", "smol_str/serde"]
+
+# ── Backends ──────────────────────────────────────────────
+#
+# Each chains 1:1 to `whispercpp-sys`'s matching feature,
+# which is what actually toggles whisper.cpp / ggml's CMake
+# `-DGGML_*=ON` flag.
+
+# Apple-only:
+metal    = ["whispercpp-sys/metal"]    # GGML_METAL: Metal GPU
+coreml   = ["whispercpp-sys/coreml"]   # WHISPER_COREML: ANE encoder
+
+# Cross-platform GPU:
+vulkan   = ["whispercpp-sys/vulkan"]   # GGML_VULKAN: Vulkan compute
+opencl   = ["whispercpp-sys/opencl"]   # GGML_OPENCL: mobile / Adreno
+
+# Vendor-specific GPU:
+cuda     = ["whispercpp-sys/cuda"]     # NVIDIA
+hipblas  = ["whispercpp-sys/hipblas"]  # AMD ROCm/HIP
+sycl     = ["whispercpp-sys/sycl"]     # Intel oneAPI / Arc
+musa     = ["whispercpp-sys/musa"]     # Moore Threads
+
+# Encoder accelerators (similar role to CoreML on other vendors):
+openvino = ["whispercpp-sys/openvino"] # Intel OpenVINO
+
+# CPU BLAS:
+openblas = ["whispercpp-sys/openblas"] # OpenBLAS
+
+[dependencies]
+# Low-level FFI to whisper.cpp. Path dep — sibling crate at
+# `../whispercpp-sys/`. All `unsafe extern "C"` declarations
+# live there; this crate only ever calls them behind safe
+# wrappers.
+whispercpp-sys = { version = "0.1", path = "../whispercpp-sys", default-features = false }
+# Public error type. `thiserror` keeps things light.
+thiserror = { version = "2", default-features = false }
+# Inline small strings (≤23 bytes) for error payloads — paths,
+# language hints, single-char interior-NUL diagnostics. Avoids
+# a heap allocation on every `WhisperError::ContextLoad` /
+# `InvalidCString`.
+smol_str = { version = "0.3", default-features = false }
+# Optional serde, gated by the `serde` feature. When enabled,
+# `Lang` round-trips through the canonical lowercase ISO-639-1
+# string (`"en"`, `"yue"`, …).
+serde = { version = "1", optional = true, default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+# Hound is for the `examples/smoke.rs` WAV reader only — never
+# pulled into a production build of `whispercpp` itself.
+hound      = "3"
+# `lang.rs`'s serde tests round-trip through JSON. Dev-only —
+# no runtime cost in production builds.
+serde_json = "1"
+
+[[example]]
+name = "smoke"
+path = "examples/smoke.rs"
+
+[lints]
+workspace = true

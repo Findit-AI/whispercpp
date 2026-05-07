@@ -1,0 +1,4 @@
+[submodule "whispercpp-sys/whisper.cpp"]
+	path = whispercpp-sys/whisper.cpp
+	url = https://github.com/Findit-AI/whisper.cpp.git
+	branch = rust
