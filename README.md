@@ -32,12 +32,17 @@ Safe Rust bindings for [whisper.cpp][whisper-cpp] speech-to-text inference.
 - **Backend matrix.** Metal, CoreML, Vulkan, OpenCL, CUDA, ROCm
   (HIP), oneAPI (SYCL), Moore Threads (MUSA), OpenVINO, OpenBLAS —
   all opt-in via Cargo features.
+- **DTW token timestamps.** Built-in token-level timing via DTW
+  over the configured alignment heads (`AlignmentHeadsPreset`),
+  with safe per-token availability through
+  `Token::t_dtw() -> Option<i64>`. See
+  [DTW timestamps](#dtw-timestamps).
 
 ## Installation
 
 ```toml
 [dependencies]
-whispercpp = "0.1"
+whispercpp = "0.2"
 ```
 
 The default build is plain CPU. Opt into accelerators per-target:
@@ -45,11 +50,11 @@ The default build is plain CPU. Opt into accelerators per-target:
 ```toml
 # macOS Apple Silicon
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
-whispercpp = { version = "0.1", features = ["metal", "coreml"] }
+whispercpp = { version = "0.2", features = ["metal", "coreml"] }
 
 # Linux + NVIDIA
 [target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
-whispercpp = { version = "0.1", features = ["cuda"] }
+whispercpp = { version = "0.2", features = ["cuda"] }
 ```
 
 ## Examples
@@ -79,6 +84,70 @@ which toggles the corresponding ggml / whisper CMake flag.
 GPU backends require the corresponding vendor SDK (CUDA Toolkit,
 ROCm, oneAPI, etc.) installed at link time. CI exercises the
 bundled CPU path on Linux/macOS/Windows and Metal+CoreML on macOS.
+
+## DTW timestamps
+
+Token-level timestamps via DTW over the decoder's
+cross-attention weights. Enable at `Context` construction:
+
+```rust
+use whispercpp::{Context, ContextParams, AlignmentHeadsPreset};
+
+let ctx = Context::new(
+    "ggml-large-v3-turbo.bin",
+    ContextParams::new()
+        .with_use_gpu(true)
+        .with_dtw_token_timestamps(true)
+        .with_dtw_aheads_preset(AlignmentHeadsPreset::LargeV3Turbo),
+)?;
+```
+
+Match `AlignmentHeadsPreset` to your model — the safe API
+ships every standard checkpoint preset (`TinyEn` through
+`LargeV3Turbo`). Mismatched presets produce noisy timings
+without erroring; bound-checked by `required_dtw_mem_size_for`
+and rejected at load if the model's `n_text_ctx` exceeds
+`SUPPORTED_DTW_N_TEXT_CTX`.
+
+After `state.full(&params, &samples)`, read per-token DTW
+timing as `Option<i64>` (centiseconds):
+
+```rust
+for i in 0..state.n_segments() {
+    let seg = state.segment(i).unwrap();
+    for j in 0..seg.n_tokens() {
+        let token = seg.token(j).unwrap();
+        match token.t_dtw() {
+            Some(t) => println!("token={} t_dtw={:.2}s",
+                token.id(), t as f64 / 100.0),
+            None    => /* DTW unavailable for this token */ (),
+        }
+    }
+}
+```
+
+`None` covers four cases: DTW not enabled at construction,
+non-text token (special / timestamp), per-segment DTW skip
+because `Params::set_audio_ctx` was overridden too small, or
+audio window too short for the median-filter pass. The
+underlying C-side patch (`whispercpp-sys: dtw t_dtw sentinel
+init`) initialises `t_dtw = -1` before every DTW pass so the
+sentinel uniquely identifies "unavailable" — `Some(0)` is a
+valid timestamp (token at audio offset 0), not the sentinel.
+
+Constraints (enforced at `Context::new`):
+
+| Constraint | What it does |
+|---|---|
+| `dtw + flash_attn` | Rejected. Whisper.cpp silently disables DTW under flash-attn; the wrapper refuses the combination explicitly. |
+| `dtw + custom n_text_ctx > 448` | Rejected. The DTW scratch arena is sized for standard whisper checkpoints; non-standard models with larger text context would overflow it. |
+| `dtw_mem_size` | Clamped to `[MIN_DTW_MEM_SIZE, MAX_DTW_MEM_SIZE]`, then raised to the per-preset minimum from `required_dtw_mem_size_for`. |
+
+Native abort paths inside the DTW helper
+(allocation failures, invalid windows, decoder errors) are
+all converted to `WhisperError::StateLost` via the existing
+exception shim — no `abort()` is reachable from safe Rust
+through this surface.
 
 ## Memory safety
 

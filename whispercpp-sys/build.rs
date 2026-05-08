@@ -116,51 +116,142 @@ fn bundled_build() {
 /// upstream AND someone manually replacing the submodule with
 /// a different tree.
 fn verify_patched_source(whisper_src: &Path) {
-  let target = whisper_src.join("src").join("whisper.cpp");
-  let body = match std::fs::read_to_string(&target) {
-    Ok(b) => b,
-    Err(e) => panic!(
-      "whispercpp-sys: failed to read {} for patch verification: {e}",
-      target.display()
-    ),
-  };
-
   // Sentinels chosen from the highest-leverage patches —
   // the ones whose absence would re-introduce the
-  // double-free / null-deref / leak hazards the Rust
-  // wrapper assumes are closed.
-  const REQUIRED_MARKERS: &[&str] = &[
-    "whispercpp-sys: kv_cache_free idempotent fix",
-    "whispercpp-sys: read_safe zero-init",
-    "whispercpp-sys: init_state RAII entry",
-    "whispercpp-sys: init_context RAII entry",
-    "whispercpp-sys: tensor header validation (model_load)",
-    "whispercpp-sys: ggml_log_set once-per-process",
-    "whispercpp-sys: hparams validation",
-    "whispercpp-sys: lang_str null guard",
-    "whispercpp-sys: special-token bounds check",
-    "whispercpp-sys: path_model assignment guard",
-    "whispercpp-sys: sched abort callback wiring",
-    "whispercpp-sys: vad_init RAII guard",
+  // double-free / null-deref / leak / native-abort hazards
+  // the Rust wrapper assumes are closed. Each entry is
+  // `(file_relative_to_whisper_src, expected_marker)`; the
+  // build hard-fails if any are absent.
+  //
+  // We split across both `src/whisper.cpp` and
+  // `ggml/src/ggml.c` because some safety patches sit in
+  // each. The ggml patch (OOM-safe `ggml_init`) is what
+  // turns the DTW scratch-allocation OOM path from
+  // `abort()`-uncatchable into a `WhisperError::StateLost`
+  // recovery — without it the wrapper's `dtw scratch
+  // alloc-fail throws` patch is dead code.
+  const REQUIRED_MARKERS: &[(&str, &str)] = &[
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: kv_cache_free idempotent fix",
+    ),
+    ("src/whisper.cpp", "whispercpp-sys: read_safe zero-init"),
+    ("src/whisper.cpp", "whispercpp-sys: init_state RAII entry"),
+    ("src/whisper.cpp", "whispercpp-sys: init_context RAII entry"),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: tensor header validation (model_load)",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: ggml_log_set once-per-process",
+    ),
+    ("src/whisper.cpp", "whispercpp-sys: hparams validation"),
+    ("src/whisper.cpp", "whispercpp-sys: lang_str null guard"),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: special-token bounds check",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: path_model assignment guard",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: sched abort callback wiring",
+    ),
+    ("src/whisper.cpp", "whispercpp-sys: vad_init RAII guard"),
+    ("src/whisper.cpp", "whispercpp-sys: dtw scratch RAII guard"),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: dtw scratch alloc-fail throws",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: dtw token assignment bounded",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: dtw short-window medfilt clamp",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: dtw audio_ctx override guard",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: ggml_init throw-on-null wrapper",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: dtw decode failure throws",
+    ),
+    ("src/whisper.cpp", "whispercpp-sys: kv buffer null throws"),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: dtw backtrace impossible-case throws",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: dtw aheads_cross_QKs invariants throw",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: token_to_str sparse-vocab no-throw",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: hparams head divisibility check",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: dtw backend compute throws",
+    ),
+    ("src/whisper.cpp", "whispercpp-sys: dtw t_dtw sentinel init"),
+    (
+      "ggml/src/ggml.c",
+      "whispercpp-sys: ggml_init OOM-safe context alloc",
+    ),
   ];
 
-  let missing: Vec<&str> = REQUIRED_MARKERS
-    .iter()
-    .copied()
-    .filter(|m| !body.contains(m))
-    .collect();
+  // Read each referenced file once, then check every
+  // marker that points at it. Group markers by file so we
+  // don't re-read the same source on every iteration.
+  use std::collections::HashMap;
+  let mut by_file: HashMap<&str, Vec<&str>> = HashMap::new();
+  for (file, marker) in REQUIRED_MARKERS {
+    by_file.entry(*file).or_default().push(*marker);
+  }
+
+  let mut missing: Vec<(&str, &str)> = Vec::new();
+  for (rel, markers) in &by_file {
+    let target = whisper_src.join(rel);
+    let body = match std::fs::read_to_string(&target) {
+      Ok(b) => b,
+      Err(e) => panic!(
+        "whispercpp-sys: failed to read {} for patch verification: {e}",
+        target.display()
+      ),
+    };
+    for m in markers {
+      if !body.contains(*m) {
+        missing.push((*rel, *m));
+      }
+    }
+  }
 
   if !missing.is_empty() {
     panic!(
-      "whispercpp-sys: the linked whisper.cpp source at {} is missing the rust-branch patches \
+      "whispercpp-sys: the linked whisper.cpp source under {} is missing rust-branch patches \
        (required marker{} absent: {:?}).\n\n\
        The Rust safety surface depends on these patches; building against unpatched upstream \
-       reintroduces multi-decoder double-free / use-after-free / null-deref classes.\n\n\
+       reintroduces multi-decoder double-free / use-after-free / null-deref / native-abort \
+       classes.\n\n\
        Fix: ensure the submodule tracks `Findit-AI/whisper.cpp` branch `rust`. Run\n  \
        git submodule update --init --recursive\n\
        from the repo root. If you intentionally pointed at a different source, add equivalent \
        patches and the matching marker comments before retrying.",
-      target.display(),
+      whisper_src.display(),
       if missing.len() == 1 { "" } else { "s" },
       missing,
     );

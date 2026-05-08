@@ -488,6 +488,28 @@ impl<'a> Segment<'a> {
 /// Read-only snapshot. All fields are private; access goes
 /// through `const fn` accessors to keep the public surface
 /// stable as `whisper_token_data` evolves upstream.
+///
+/// # Two timestamp sources
+///
+/// Whisper.cpp can produce per-token timing two different ways,
+/// and they live in different fields:
+///
+/// * [`Self::t0`] / [`Self::t1`] come from the **timestamp-token
+///   path** — whisper.cpp's standard heuristic that pairs each
+///   token with the surrounding `<|t_x|>` markers. These are
+///   populated when [`crate::Params::set_token_timestamps`] is
+///   `true`, regardless of DTW.
+/// * [`Self::t_dtw`] comes from the **DTW backtrace** —
+///   independently derived from cross-attention weights of the
+///   alignment heads. Only populated when DTW is enabled at
+///   [`Context`] load time via
+///   [`crate::ContextParams::with_dtw_token_timestamps`] (and
+///   a non-`None`
+///   [`crate::ContextParams::with_dtw_aheads_preset`]).
+///
+/// DTW is generally more robust to long silences and repeated
+/// tokens than the timestamp-token path; the timestamp-token
+/// path is cheaper but more sensitive to attention misallocation.
 #[derive(Debug, Clone, Copy)]
 pub struct Token {
   id: i32,
@@ -497,6 +519,7 @@ pub struct Token {
   ptsum: f32,
   t0: i64,
   t1: i64,
+  t_dtw: i64,
   vlen: f32,
 }
 
@@ -531,16 +554,68 @@ impl Token {
     self.ptsum
   }
 
-  /// DTW-derived start time (centiseconds), if available.
+  /// Token start time, in centiseconds, derived from the
+  /// timestamp-token path. `0` when
+  /// [`crate::Params::set_token_timestamps`] is `false`.
+  /// **Not** the DTW timestamp — see [`Self::t_dtw`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn t0(&self) -> i64 {
     self.t0
   }
 
-  /// DTW-derived end time (centiseconds), if available.
+  /// Token end time, in centiseconds, derived from the
+  /// timestamp-token path. `0` when
+  /// [`crate::Params::set_token_timestamps`] is `false`.
+  /// **Not** the DTW timestamp — see [`Self::t_dtw`].
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn t1(&self) -> i64 {
     self.t1
+  }
+
+  /// DTW-derived token timestamp, in centiseconds. Roughly the
+  /// moment in the audio at which whisper.cpp emitted this
+  /// token, computed by running DTW over the configured
+  /// alignment heads' cross-attention weights.
+  ///
+  /// Returns `Some(t)` when DTW computed a real timestamp for
+  /// this token. Returns `None` when DTW timing is unavailable
+  /// for any of these reasons:
+  ///
+  /// * DTW was not enabled at [`Context`] construction
+  ///   (`with_dtw_token_timestamps(false)`, or preset left at
+  ///   [`crate::AlignmentHeadsPreset::None`]).
+  /// * The token is a non-text (special / timestamp) token —
+  ///   DTW only writes timing for text tokens.
+  /// * DTW skipped this segment because the chunk's
+  ///   `audio_ctx` (overridden by
+  ///   [`crate::Params::set_audio_ctx`]) was too small for
+  ///   the chunk duration.
+  /// * DTW skipped this segment because the audio window was
+  ///   too short for the median-filter pass
+  ///   (`n_audio_tokens <= 1`, ≤20 ms).
+  ///
+  /// The `whispercpp-sys: dtw t_dtw sentinel init` patch in
+  /// `whisper.cpp` initialises every text token's `t_dtw` to
+  /// `-1` at the start of the DTW pass; successful
+  /// computation overwrites with a non-negative timestamp,
+  /// while skip paths leave the sentinel in place. Negative
+  /// timestamps are unreachable for valid DTW output, so `-1`
+  /// uniquely identifies "unavailable."
+  ///
+  /// Whisper.cpp ships validated alignment-head presets for
+  /// every standard checkpoint (see
+  /// [`crate::AlignmentHeadsPreset`]); using a preset that
+  /// doesn't match the loaded model produces unreliable DTW
+  /// timings without erroring — but this method still returns
+  /// `Some(...)` because the values were "computed", just
+  /// not meaningfully. Match the preset to the model.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub const fn t_dtw(&self) -> Option<i64> {
+    if self.t_dtw < 0 {
+      None
+    } else {
+      Some(self.t_dtw)
+    }
   }
 
   /// Voice activity score, if available.
@@ -561,7 +636,131 @@ impl Token {
       ptsum: raw.ptsum,
       t0: raw.t0,
       t1: raw.t1,
+      t_dtw: raw.t_dtw,
       vlen: raw.vlen,
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  /// `Token::from_raw` projects every field — including
+  /// [`Token::t_dtw`], which earlier
+  /// versions of this wrapper missed entirely (the C struct
+  /// carried it but the safe view didn't surface it). Pin
+  /// the projection so a future refactor can't quietly drop
+  /// a field again.
+  #[test]
+  fn token_from_raw_projects_every_field_including_t_dtw() {
+    let raw = sys::whisper_token_data {
+      id: 1234,
+      tid: 5678,
+      p: 0.8,
+      plog: -0.22,
+      pt: 0.05,
+      ptsum: 0.12,
+      t0: 100,
+      t1: 250,
+      t_dtw: 175,
+      vlen: 0.42,
+    };
+    let tok = Token::from_raw(raw);
+    assert_eq!(tok.id(), 1234);
+    assert!((tok.p() - 0.8).abs() < 1e-6);
+    assert!((tok.plog() - -0.22).abs() < 1e-6);
+    assert!((tok.pt() - 0.05).abs() < 1e-6);
+    assert!((tok.ptsum() - 0.12).abs() < 1e-6);
+    assert_eq!(tok.t0(), 100);
+    assert_eq!(tok.t1(), 250);
+    assert_eq!(
+      tok.t_dtw(),
+      Some(175),
+      "Token::from_raw must project the DTW timestamp",
+    );
+    assert!((tok.vlen() - 0.42).abs() < 1e-6);
+  }
+
+  /// The DTW timestamp is independent from `t0`/`t1` — it
+  /// comes from a different mechanism (cross-attention DTW vs.
+  /// timestamp-token decoding). Confirm the safe view exposes
+  /// distinct values rather than aliasing them.
+  #[test]
+  fn t_dtw_is_independent_of_t0_t1() {
+    let raw = sys::whisper_token_data {
+      id: 0,
+      tid: 0,
+      p: 0.0,
+      plog: 0.0,
+      pt: 0.0,
+      ptsum: 0.0,
+      t0: 100,
+      t1: 200,
+      t_dtw: 150,
+      vlen: 0.0,
+    };
+    let tok = Token::from_raw(raw);
+    assert_eq!(tok.t0(), 100);
+    assert_eq!(tok.t1(), 200);
+    assert_eq!(tok.t_dtw(), Some(150));
+    // Sanity: distinct values flow through distinct accessors,
+    // not collapsed into one.
+    assert_ne!(tok.t_dtw(), Some(tok.t0()));
+    assert_ne!(tok.t_dtw(), Some(tok.t1()));
+  }
+
+  /// `t_dtw == -1` is the sentinel set by the
+  /// `whispercpp-sys: dtw t_dtw sentinel init` patch when DTW
+  /// is enabled but skipped for a segment (audio_ctx mismatch
+  /// or short-window medfilt). The wrapper must surface that
+  /// as `None` so callers can distinguish "DTW skipped" from
+  /// "DTW computed at audio offset 0."
+  #[test]
+  fn t_dtw_sentinel_minus_one_maps_to_none() {
+    let raw = sys::whisper_token_data {
+      id: 0,
+      tid: 0,
+      p: 0.0,
+      plog: 0.0,
+      pt: 0.0,
+      ptsum: 0.0,
+      t0: 0,
+      t1: 0,
+      t_dtw: -1,
+      vlen: 0.0,
+    };
+    let tok = Token::from_raw(raw);
+    assert_eq!(
+      tok.t_dtw(),
+      None,
+      "t_dtw == -1 must surface as None (DTW unavailable for token)",
+    );
+  }
+
+  /// `t_dtw == 0` is a *valid* DTW result for a token that
+  /// starts at audio offset 0. It must NOT be confused with
+  /// the unavailable sentinel — pin so a future "treat 0 as
+  /// missing" refactor can't silently break this.
+  #[test]
+  fn t_dtw_zero_maps_to_some_zero() {
+    let raw = sys::whisper_token_data {
+      id: 0,
+      tid: 0,
+      p: 0.0,
+      plog: 0.0,
+      pt: 0.0,
+      ptsum: 0.0,
+      t0: 0,
+      t1: 0,
+      t_dtw: 0,
+      vlen: 0.0,
+    };
+    let tok = Token::from_raw(raw);
+    assert_eq!(
+      tok.t_dtw(),
+      Some(0),
+      "t_dtw == 0 is a valid timestamp (token at audio start), not the sentinel",
+    );
   }
 }
