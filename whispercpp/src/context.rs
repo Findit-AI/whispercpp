@@ -111,12 +111,34 @@ pub const MIN_DTW_MEM_SIZE: usize = DEFAULT_DTW_MEM_SIZE;
 /// internally; passing `usize::MAX` overflows that addition and
 /// drives `ggml_init` to NULL on the malloc step, with the
 /// same null-deref / GGML_ASSERT consequences as the lower-
-/// bound failure shape (see [`MIN_DTW_MEM_SIZE`]). Cap at 4 GiB
-/// — three orders of magnitude above the realistic worst case
-/// — so a `usize::MAX` slip from safe Rust collapses to a
-/// large-but-allocatable value rather than an overflow-induced
-/// abort.
+/// bound failure shape (see [`MIN_DTW_MEM_SIZE`]).
+///
+/// The cap is **target-pointer-width-dependent**:
+///
+/// * 64-bit (`target_pointer_width = "64"`): 4 GiB — three
+///   orders of magnitude above the realistic worst case
+///   ([`required_dtw_mem_size_for(LargeV2)`][required_dtw_mem_size_for]
+///   = 278 MiB), so a `usize::MAX` slip collapses to a
+///   large-but-allocatable value rather than an
+///   overflow-induced abort.
+/// * 32-bit (`target_pointer_width = "32"`): 1 GiB.
+///   `4 * 1024 * 1024 * 1024 = 2^32` exceeds `usize::MAX =
+///   2^32 - 1` on 32-bit targets, which would make the crate
+///   fail to compile there. 1 GiB is still ~3.7× the
+///   `LargeV2` per-preset minimum and well below
+///   `usize::MAX`, so the safety property (saturate above
+///   the realistic worst case to dodge `ggml_init` overflow)
+///   is preserved.
+/// * 16-bit (`target_pointer_width = "16"`): same value as
+///   32-bit; falls back to the smaller cap. Whisper.cpp
+///   does not realistically run on 16-bit targets.
+#[cfg(target_pointer_width = "64")]
 pub const MAX_DTW_MEM_SIZE: usize = 4 * 1024 * 1024 * 1024;
+
+/// 32-bit / 16-bit ceiling — see [`MAX_DTW_MEM_SIZE`]'s
+/// docstring on the 64-bit variant for the full explanation.
+#[cfg(not(target_pointer_width = "64"))]
+pub const MAX_DTW_MEM_SIZE: usize = 1024 * 1024 * 1024;
 
 /// Clamp a DTW memory budget to `[MIN_DTW_MEM_SIZE,
 /// MAX_DTW_MEM_SIZE]`. `const fn` so it composes inside
