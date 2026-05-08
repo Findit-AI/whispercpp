@@ -1285,8 +1285,11 @@ mod tests {
     // Above ceiling → MAX.
     assert_eq!(clamp_dtw_mem_size(MAX_DTW_MEM_SIZE + 1), MAX_DTW_MEM_SIZE);
     assert_eq!(clamp_dtw_mem_size(usize::MAX), MAX_DTW_MEM_SIZE);
-    // Floor & ceiling order pin.
-    assert!(MIN_DTW_MEM_SIZE <= MAX_DTW_MEM_SIZE);
+    // Floor & ceiling order pin. Comparison is between two
+    // `const`s, so clippy's `assertions_on_constants` lint
+    // wants a `const { ... }` block to make the compile-time
+    // evaluation explicit.
+    const { assert!(MIN_DTW_MEM_SIZE <= MAX_DTW_MEM_SIZE) };
     assert_eq!(MIN_DTW_MEM_SIZE, DEFAULT_DTW_MEM_SIZE);
   }
 
