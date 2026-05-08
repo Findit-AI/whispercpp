@@ -10,7 +10,10 @@ mod params;
 mod state;
 mod sys;
 
-pub use context::{Context, ContextParams, system_info};
+pub use context::{
+  AlignmentHeadsPreset, Context, ContextParams, DEFAULT_DTW_MEM_SIZE, MAX_DTW_MEM_SIZE,
+  MIN_DTW_MEM_SIZE, SUPPORTED_DTW_N_TEXT_CTX, required_dtw_mem_size_for, system_info,
+};
 pub use error::{WhisperError, WhisperResult};
 pub use lang::Lang;
 pub use params::{

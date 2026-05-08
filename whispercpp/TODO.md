@@ -100,18 +100,6 @@ requires more design than a 1:1 port.
 Symbols: `whisper_set_log_callback`, `set_debug_mode`,
 `whisper_log_callback`.
 
-### DTW token timestamps
-
-Whispery uses wav2vec2 forced alignment for word-level timing.
-whisper.cpp's DTW path is a parallel mechanism with its own
-configuration (`dtw_aheads`, `dtw_n_top`, `dtw_mem_size`). Wrapping
-it would invite confusion about which timestamping path is
-authoritative.
-
-Symbols: `whisper_full_params::dtw_token_timestamps` (true at
-construction, but `Params::set_dtw_*` and `dtw_aheads` array are
-not exposed), `whisper_aheads`, `whisper_full_get_token_dtw_t0_*`.
-
 ### Buffer-load constructors
 
 We support `Context::new(path, params)` only. Loading from an

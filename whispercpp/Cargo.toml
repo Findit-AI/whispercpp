@@ -1,6 +1,6 @@
 [package]
 name        = "whispercpp"
-version     = "0.1.0"
+version     = "0.2.0"
 edition.workspace      = true
 rust-version.workspace = true
 license.workspace      = true
@@ -76,7 +76,7 @@ openblas = ["whispercpp-sys/openblas"] # OpenBLAS
 # `../whispercpp-sys/`. All `unsafe extern "C"` declarations
 # live there; this crate only ever calls them behind safe
 # wrappers.
-whispercpp-sys = { version = "0.1", path = "../whispercpp-sys", default-features = false }
+whispercpp-sys = { version = "0.2", path = "../whispercpp-sys", default-features = false }
 # Public error type. `thiserror` keeps things light.
 thiserror = { version = "2", default-features = false }
 # Inline small strings (≤23 bytes) for error payloads — paths,
