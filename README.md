@@ -17,6 +17,8 @@ Safe Rust bindings for [whisper.cpp][whisper-cpp] speech-to-text inference.
 
 </div>
 
+## Introduction
+
 Safe Rust bindings for [whisper.cpp][whisper-cpp] speech-to-text inference.
 
 - **Always-bundled build.** `whispercpp-sys` cmake-builds a vendored,
