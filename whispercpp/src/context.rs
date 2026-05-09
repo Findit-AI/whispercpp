@@ -1011,12 +1011,21 @@ impl Context {
   /// precondition is enforced at every call site by the
   /// borrow checker via the `unsafe` block.
   ///
-  /// `unsafe fn` is preferred over returning `ManuallyDrop`
-  /// because tests need to wrap the result in `Arc` to
-  /// match the production shape; an `Arc<ManuallyDrop<Self>>`
-  /// would still drop the inner `ManuallyDrop` via
-  /// `Arc`'s refcount mechanism. Test fixtures handle the
-  /// forget at the call site.
+  /// `unsafe fn` is preferred over returning
+  /// `ManuallyDrop<Self>` because production code (and the
+  /// `State::poisoned_for_test` helper that consumes this)
+  /// expects an `Arc<Context>`, not an
+  /// `Arc<ManuallyDrop<Context>>`. The two are different
+  /// types — `ManuallyDrop` IS sufficient to suppress the
+  /// inner `Context`'s drop (its destructor is a no-op),
+  /// so the UB itself would be prevented; the issue is
+  /// purely API-shape compatibility with the production
+  /// `Arc<Context>` field on `State`. The
+  /// `PoisonedStateFixture` test guard sidesteps this by
+  /// holding a separate `ManuallyDrop<Arc<Context>>` clone
+  /// alongside the State — the `unsafe fn` here is the
+  /// raw-pointer producer, the guard handles the leak
+  /// invariant via composition.
   #[cfg(test)]
   pub(crate) unsafe fn dangling_for_test() -> Self {
     Self {

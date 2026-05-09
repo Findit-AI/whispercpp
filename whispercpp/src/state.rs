@@ -819,8 +819,9 @@ impl<'a> Iterator for Segments<'a> {
     // requires `&mut self`). Construct the `Segment`
     // directly to skip the redundant FFI call.
     //
-    // `self.state.ptr` is a `pub(super)` field readable from
-    // this module. `Some(_)` is implied by `end > 0` (a
+    // `self.state.ptr` is a private field on `State`,
+    // readable here because `Segments` lives in the same
+    // module. `Some(_)` is implied by `end > 0` (a
     // poisoned state's `n_segments()` returns 0 via the
     // `self.raw()?` early-return), but checking it
     // defensively keeps this branch verifiable in
@@ -1289,43 +1290,81 @@ mod tests {
   // iteration). The compile-only test below proves the
   // lifetime threading is sound for the non-empty case too.
 
-  /// Build a poisoned `State` and forget the dangling Arc on
-  /// drop so the test never hits `whisper_free` on a fake
-  /// pointer. Returns a `ManuallyDrop`-shaped pair: the
-  /// `State` to drive iterators on, plus a manual cleanup
-  /// closure that mem::forgets the underlying Arc payload.
-  fn poisoned_state_for_test() -> State {
-    // SAFETY: `Context::dangling_for_test` is unsafe
-    // because its `Drop` would call `whisper_free` on a
-    // dangling pointer. We satisfy the precondition by
-    // `mem::forget`'ing the only `Arc<Context>` we hold
-    // here AND by `forget_poisoned_state` at every call
-    // site of this helper. The `State` returned shares
-    // its own Arc handle with the leaked one above; when
-    // the State drops, refcount goes 2 → 1, but the
-    // forgotten Arc keeps the count at 1 forever — so
-    // `Arc::drop` never reaches refcount 0 and
-    // `Context::drop` never runs.
-    //
-    // Miri note: every call to this helper leaks one
-    // `ArcInner` (40 bytes) by design — Miri's default
-    // leak checker correctly flags it. Tests that drive
-    // this fixture are tagged `#[cfg_attr(miri, ignore =
-    // "...")]` so Miri skips them; pure compile-time
-    // tests (PhantomData / trait-bound assertions) stay
-    // covered.
-    let ctx = Arc::new(unsafe { Context::dangling_for_test() });
-    let state = State::poisoned_for_test(Arc::clone(&ctx));
-    core::mem::forget(ctx);
-    state
+  /// RAII fixture for iterator tests that need a `State`
+  /// without a real model file. Holds:
+  ///
+  /// * The `State` itself (with `ptr: None`, so `n_segments()
+  ///   == 0` and every accessor early-returns; `State::drop`
+  ///   is a no-op on this branch — `whisper_free_state` is
+  ///   never called).
+  /// * A `ManuallyDrop<Arc<Context>>` that keeps the inner
+  ///   `Context`'s strong count permanently above zero. The
+  ///   `State` field carries its own `Arc<Context>` clone (in
+  ///   its private `ctx` field); when the State drops, that
+  ///   clone decrements 2 → 1, and the leaked clone here
+  ///   keeps the count at 1 forever — so `Context::drop`
+  ///   never runs and the dangling `whisper_context*` never
+  ///   reaches `whisper_free`.
+  ///
+  /// Why a guard instead of a free function + manual
+  /// `mem::forget`: the previous helper-pair design
+  /// (`poisoned_state_for_test` + a separate
+  /// `forget_poisoned_state(state)` cleanup call at every
+  /// test) was fragile against early-return / panic mid-test
+  /// — the cleanup wouldn't run and the held `Arc<Context>`
+  /// could decrement to refcount 0 (calling `Context::drop`
+  /// on the dangling pointer). The `ManuallyDrop` makes the
+  /// leak invariant destructor-managed: even if the test
+  /// panics, the fixture's `Drop` chain still suppresses
+  /// the held Arc's decrement.
+  ///
+  /// Miri note: every fixture instance leaks one `ArcInner`
+  /// (40 bytes) by design — Miri's default leak checker
+  /// correctly flags it. Tests that construct this fixture
+  /// are tagged `#[cfg_attr(miri, ignore = "...")]` so Miri
+  /// skips them; pure compile-time tests (`PhantomData` +
+  /// trait-bound assertions) stay covered.
+  ///
+  /// Implements `Deref<Target = State>` so test code reads
+  /// `fixture.segments_iter()` instead of
+  /// `fixture.state().segments_iter()`. For `IntoIterator`
+  /// tests that need an explicit `&State` (the trait is
+  /// implemented for `&State`, not `&PoisonedStateFixture`),
+  /// use `&*fixture` to take a reborrow through the Deref.
+  struct PoisonedStateFixture {
+    state: State,
+    // Held in a `ManuallyDrop` rather than `mem::forget`'d:
+    // the field's destructor is a no-op (ManuallyDrop's
+    // semantics), so the leak survives test panics /
+    // early-returns without an explicit forget call.
+    _leaked_ctx: core::mem::ManuallyDrop<Arc<Context>>,
   }
 
-  /// Drop helper: leak the State's internal Arc<Context> so
-  /// the dangling pointer in the test Context never reaches
-  /// `whisper_free`. Mirrors the `mem::forget` pattern in
-  /// `context.rs::tests::fresh_context_marker_starts_unpoisoned`.
-  fn forget_poisoned_state(state: State) {
-    core::mem::forget(state);
+  impl PoisonedStateFixture {
+    fn new() -> Self {
+      // SAFETY: `Context::dangling_for_test` requires the
+      // returned value (or any `Arc<Context>` derived from
+      // it) never reach refcount 0 — otherwise
+      // `Context::drop` would call `whisper_free` on
+      // `NonNull::dangling()`. We satisfy this by storing
+      // an extra clone in `ManuallyDrop`, which suppresses
+      // the contained Arc's decrement on `Drop` (this
+      // fixture's destructor inherits ManuallyDrop's no-op
+      // behaviour for that field).
+      let ctx = Arc::new(unsafe { Context::dangling_for_test() });
+      let state = State::poisoned_for_test(Arc::clone(&ctx));
+      Self {
+        state,
+        _leaked_ctx: core::mem::ManuallyDrop::new(ctx),
+      }
+    }
+  }
+
+  impl core::ops::Deref for PoisonedStateFixture {
+    type Target = State;
+    fn deref(&self) -> &State {
+      &self.state
+    }
   }
 
   /// Empty (poisoned) state yields zero segments. Exercises
@@ -1334,14 +1373,14 @@ mod tests {
   /// nonzero count or panics on this input is broken.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn segments_iter_empty_state_yields_zero_items() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     let count = state.segments_iter().count();
     assert_eq!(count, 0, "poisoned state must yield zero segments");
-    forget_poisoned_state(state);
   }
 
   /// Iterator length agrees with `n_segments()`. Pins the
@@ -1349,16 +1388,16 @@ mod tests {
   /// caching the count differently) can't desynchronise.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn segments_iter_count_matches_n_segments() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     let expected = state.n_segments();
     assert_eq!(expected, 0, "test fixture is poisoned");
     let actual = state.segments_iter().count() as i32;
     assert_eq!(actual, expected);
-    forget_poisoned_state(state);
   }
 
   /// `ExactSizeIterator::len()` returns the same value as
@@ -1368,17 +1407,17 @@ mod tests {
   /// or panic.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn segments_iter_exact_size_len_matches_count() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     let iter = state.segments_iter();
     let len_before = iter.len();
     let counted = iter.count();
     assert_eq!(len_before, counted);
     assert_eq!(len_before, 0);
-    forget_poisoned_state(state);
   }
 
   /// `size_hint` returns `(len, Some(len))` because the
@@ -1387,16 +1426,16 @@ mod tests {
   /// adapters like `Vec::extend` can pre-allocate optimally.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn segments_iter_size_hint_is_exact() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     let iter = state.segments_iter();
     let (lower, upper) = iter.size_hint();
     assert_eq!(lower, 0);
     assert_eq!(upper, Some(0));
-    forget_poisoned_state(state);
   }
 
   /// `FusedIterator`: once exhausted, repeat `next()` calls
@@ -1405,16 +1444,16 @@ mod tests {
   /// promises this — pin it.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn segments_iter_fused_after_exhaustion() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     let mut iter = state.segments_iter();
     assert!(iter.next().is_none());
     assert!(iter.next().is_none());
     assert!(iter.next().is_none());
-    forget_poisoned_state(state);
   }
 
   /// Two `Segments` iterators alive simultaneously must not
@@ -1425,17 +1464,17 @@ mod tests {
   /// "concurrent reads safe" claim from the doc comment.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn multiple_segments_iter_alive_concurrently() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     let it1 = state.segments_iter();
     let it2 = state.segments_iter();
     assert_eq!(it1.len(), it2.len());
     assert_eq!(it1.count(), 0);
     assert_eq!(it2.count(), 0);
-    forget_poisoned_state(state);
   }
 
   /// Iterator composes with adapters (`map`, `collect`).
@@ -1445,14 +1484,14 @@ mod tests {
   /// trait bounds.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn segments_iter_composes_with_adapters() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     let collected: Vec<_> = state.segments_iter().map(|seg| seg.t0()).collect();
     assert!(collected.is_empty());
-    forget_poisoned_state(state);
   }
 
   /// Compile-only: nested iteration `for seg in
@@ -1467,11 +1506,12 @@ mod tests {
   /// parsed and type-checked.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn nested_segments_and_tokens_iter_compiles() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     let mut total: i32 = 0;
     for seg in state.segments_iter() {
       for tok in seg.tokens_iter() {
@@ -1482,7 +1522,6 @@ mod tests {
       }
     }
     assert_eq!(total, 0);
-    forget_poisoned_state(state);
   }
 
   /// Type-shape pin: `Segments` is `Iterator<Item =
@@ -1493,18 +1532,18 @@ mod tests {
   /// to compile here.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn iterator_type_bounds_are_correct() {
     fn assert_iter<I: Iterator>(_: I) {}
     fn assert_exact_size<I: ExactSizeIterator>(_: I) {}
     fn assert_fused<I: core::iter::FusedIterator>(_: I) {}
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     assert_iter(state.segments_iter());
     assert_exact_size(state.segments_iter());
     assert_fused(state.segments_iter());
-    forget_poisoned_state(state);
   }
 
   /// Adapter composition: `flat_map` over `segments_iter`
@@ -1525,11 +1564,12 @@ mod tests {
   /// the iterator wires up correctly.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn tokens_iter_composes_with_flat_map() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     let total: usize = state
       .segments_iter()
       .flat_map(|seg| seg.tokens_iter())
@@ -1539,10 +1579,9 @@ mod tests {
     // chain. Compile-time check that `flat_map` returns
     // `Iterator<Item = Token>`.
     fn assert_token_iter<I: Iterator<Item = Token>>(_: I) {}
-    let state2 = poisoned_state_for_test();
+    let fixture2 = PoisonedStateFixture::new();
+    let state2 = &*fixture2;
     assert_token_iter(state2.segments_iter().flat_map(|seg| seg.tokens_iter()));
-    forget_poisoned_state(state);
-    forget_poisoned_state(state2);
   }
 
   /// `for seg in &state` works via [`IntoIterator for
@@ -1553,16 +1592,16 @@ mod tests {
   /// assertion.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn into_iter_for_state_ref_yields_segments() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     fn assert_segment_iter<'a, I: IntoIterator<Item = Segment<'a>>>(_: I) {}
-    assert_segment_iter(&state);
-    let count = (&state).into_iter().count();
+    assert_segment_iter(state);
+    let count = state.into_iter().count();
     assert_eq!(count, 0);
-    forget_poisoned_state(state);
   }
 
   /// `Segment: IntoIterator<Item = Token>` (by-value;
@@ -1590,18 +1629,18 @@ mod tests {
   /// assertion is the trait-bound on `.rev()`.
   #[cfg_attr(
     miri,
-    ignore = "intentional Arc leak in poisoned_state_for_test fixture"
+    ignore = "intentional Arc leak in PoisonedStateFixture"
   )]
   #[test]
   fn segments_iter_double_ended_compiles_and_empty_yields_none() {
-    let state = poisoned_state_for_test();
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
     fn assert_dei<I: DoubleEndedIterator>(_: I) {}
     assert_dei(state.segments_iter());
     let mut iter = state.segments_iter();
     assert!(iter.next_back().is_none());
     let rev_count = state.segments_iter().rev().count();
     assert_eq!(rev_count, 0);
-    forget_poisoned_state(state);
   }
 
   /// `DoubleEndedIterator` for `Tokens`: same as above —
