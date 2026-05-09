@@ -25,7 +25,7 @@ pub use params::{
   MAX_BEAM_SIZE, MAX_INITIAL_TS_S, MAX_N_THREADS, MAX_TEMPERATURE, MIN_TEMPERATURE_INC, Params,
   SamplingStrategy,
 };
-pub use state::{Segment, State, Token};
+pub use state::{Segment, Segments, State, Token, Tokens};
 
 /// Linked libwhisper version string (e.g. `"1.8.4"`).
 ///

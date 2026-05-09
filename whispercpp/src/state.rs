@@ -576,6 +576,27 @@ impl State {
     })
   }
 
+  /// Iterate every segment produced by the most recent
+  /// [`State::full`] call, in order. Equivalent to
+  /// `(0..state.n_segments()).map(|i| state.segment(i).unwrap())`
+  /// but composes with adapters (`.filter` / `.map` /
+  /// `.collect`) without an index variable.
+  ///
+  /// The yielded [`Segment`] values borrow from `&self`, so
+  /// the iterator (and every yielded `Segment`) cannot
+  /// outlive the `State`. Multiple `Segment`s can be alive
+  /// at once: each call to a `Segment` accessor is a pure
+  /// read of immutable per-call output buffers, so no
+  /// aliasing arises. A poisoned state yields zero items
+  /// (its `n_segments()` is `0`).
+  pub fn segments_iter(&self) -> Segments<'_> {
+    Segments {
+      state: self,
+      next: 0,
+      end: self.n_segments().max(0),
+    }
+  }
+
   /// Detected (or forced) language for the most recent
   /// [`State::full`] call.
   ///
@@ -700,6 +721,34 @@ impl<'a> Segment<'a> {
     Some(Token::from_raw(raw))
   }
 
+  /// Iterate every token in this segment, in decode order.
+  /// Equivalent to
+  /// `(0..segment.n_tokens()).map(|j| segment.token(j).unwrap())`
+  /// but composes with iterator adapters.
+  ///
+  /// The returned iterator owns a `Copy` of the `Segment`
+  /// (which is itself a thin index + pointer projection
+  /// from the parent [`State`]), so adapter chains like
+  /// `state.segments_iter().flat_map(|s| s.tokens_iter())`
+  /// compile — the iterator does not borrow from a
+  /// closure-local `Segment` value. The `'state` lifetime
+  /// on the returned [`Tokens`] still ties the iterator
+  /// (and every yielded item's pointer projections) to the
+  /// owning `State`.
+  ///
+  /// Yielded [`Token`] values are owned snapshots (the
+  /// underlying `whisper_token_data` is value-typed), so
+  /// they have no further lifetime constraint and can be
+  /// collected into a `Vec<Token>` for use after the
+  /// `State` is dropped.
+  pub fn tokens_iter(&self) -> Tokens<'a> {
+    Tokens {
+      segment: *self,
+      next: 0,
+      end: self.n_tokens().max(0),
+    }
+  }
+
   /// `true` if the next segment marks a speaker change
   /// (whisper.cpp's tinydiarize / `--tdrz` mode). Always
   /// `false` outside TDRZ-enabled checkpoints; exposed for
@@ -710,6 +759,224 @@ impl<'a> Segment<'a> {
     unsafe {
       sys::whisper_full_get_segment_speaker_turn_next_from_state(self.state.as_ptr(), self.idx)
     }
+  }
+}
+
+/// Iterator over the segments of a [`State`].
+///
+/// Returned by [`State::segments_iter`]. Borrows from the
+/// `State`; the borrow chain ties every yielded
+/// [`Segment`]'s lifetime to that of the iterator's
+/// underlying `&'a State`, so a yielded segment cannot
+/// outlive the state.
+///
+/// The segment count is captured at construction by reading
+/// `whisper_full_n_segments_from_state` once. Reads of
+/// per-call output buffers from concurrent
+/// `Segment` views are safe: the underlying state is
+/// immutable for the duration of the borrow (`State::full`
+/// requires `&mut self`, which Rust's borrow checker rules
+/// out while `&self` is held by this iterator).
+///
+/// Implements [`Iterator`], [`ExactSizeIterator`],
+/// [`DoubleEndedIterator`], and
+/// [`core::iter::FusedIterator`]; the length is known
+/// up-front and never changes, so reverse iteration via
+/// `.rev()` and `next_back` are O(1) per call.
+pub struct Segments<'a> {
+  state: &'a State,
+  next: i32,
+  end: i32,
+}
+
+impl<'a> Iterator for Segments<'a> {
+  type Item = Segment<'a>;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.next >= self.end {
+      return None;
+    }
+    // `State::segment(i)` would re-call `n_segments()` (FFI)
+    // for its bounds check. We already captured `end` from
+    // `n_segments()` at construction, and the borrow chain
+    // pins the underlying `whisper_state` (the count cannot
+    // change while `&self.state` is held — `State::full`
+    // requires `&mut self`). Construct the `Segment`
+    // directly to skip the redundant FFI call.
+    //
+    // `self.state.ptr` is a private field on `State`,
+    // readable here because `Segments` lives in the same
+    // module. `Some(_)` is implied by `end > 0` (a
+    // poisoned state's `n_segments()` returns 0 via the
+    // `self.raw()?` early-return), but checking it
+    // defensively keeps this branch verifiable in
+    // isolation.
+    let state_ptr = self.state.ptr?;
+    let idx = self.next;
+    self.next += 1;
+    Some(Segment {
+      state: state_ptr,
+      idx,
+      _marker: core::marker::PhantomData,
+    })
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    let remaining = (self.end - self.next).max(0) as usize;
+    (remaining, Some(remaining))
+  }
+}
+
+impl DoubleEndedIterator for Segments<'_> {
+  fn next_back(&mut self) -> Option<Self::Item> {
+    if self.next >= self.end {
+      return None;
+    }
+    let state_ptr = self.state.ptr?;
+    self.end -= 1;
+    Some(Segment {
+      state: state_ptr,
+      idx: self.end,
+      _marker: core::marker::PhantomData,
+    })
+  }
+}
+
+impl ExactSizeIterator for Segments<'_> {
+  fn len(&self) -> usize {
+    (self.end - self.next).max(0) as usize
+  }
+}
+
+impl core::iter::FusedIterator for Segments<'_> {}
+
+/// Iterator over the tokens of a [`Segment`].
+///
+/// Returned by [`Segment::tokens_iter`]. Owns a copy of
+/// the [`Segment`] (which is `Copy`: thin index + pointer
+/// projection), so adapter chains such as
+/// `state.segments_iter().flat_map(|s| s.tokens_iter())`
+/// compile — the iterator does not borrow a
+/// closure-local `Segment` value. The `'state` lifetime
+/// transitively prevents the iterator from outliving the
+/// owning [`State`].
+///
+/// Yielded [`Token`] values are owned, value-typed
+/// snapshots projected from `whisper_token_data`. They
+/// carry no borrow and can be collected into a
+/// `Vec<Token>` for use after the iterator (and the
+/// `State`) is dropped.
+///
+/// The token count is captured at construction by reading
+/// `whisper_full_n_tokens_from_state(state, segment_idx)`
+/// once. Implements [`Iterator`], [`ExactSizeIterator`],
+/// [`DoubleEndedIterator`], and
+/// [`core::iter::FusedIterator`].
+pub struct Tokens<'state> {
+  segment: Segment<'state>,
+  next: i32,
+  end: i32,
+}
+
+impl Iterator for Tokens<'_> {
+  type Item = Token;
+
+  fn next(&mut self) -> Option<Self::Item> {
+    if self.next >= self.end {
+      return None;
+    }
+    let tok_idx = self.next;
+    self.next += 1;
+    // SAFETY: `tok_idx ∈ [0, end)` by the bounds check
+    // above; `end` was captured from `self.segment.n_tokens()`
+    // at construction. The borrow chain (`Tokens<'state>` →
+    // owned `Segment<'state>` → `&'state State`) pins the
+    // underlying `whisper_state` for the iterator's
+    // lifetime — `State::full` requires `&mut self` on the
+    // owning State, so the token count cannot change
+    // mid-iteration. Skipping `Segment::token`'s
+    // `n_tokens()` FFI bounds-check shaves one FFI call
+    // per yielded token, which is the dominant cost on
+    // long segments (hundreds to low thousands of tokens
+    // per state).
+    let raw = unsafe {
+      sys::whisper_full_get_token_data_from_state(
+        self.segment.state.as_ptr(),
+        self.segment.idx,
+        tok_idx,
+      )
+    };
+    Some(Token::from_raw(raw))
+  }
+
+  fn size_hint(&self) -> (usize, Option<usize>) {
+    let remaining = (self.end - self.next).max(0) as usize;
+    (remaining, Some(remaining))
+  }
+}
+
+impl DoubleEndedIterator for Tokens<'_> {
+  fn next_back(&mut self) -> Option<Self::Item> {
+    if self.next >= self.end {
+      return None;
+    }
+    self.end -= 1;
+    // SAFETY: same as `next` — `self.end - 1 ∈ [next,
+    // captured-end)` because `next < end` was just
+    // checked.
+    let raw = unsafe {
+      sys::whisper_full_get_token_data_from_state(
+        self.segment.state.as_ptr(),
+        self.segment.idx,
+        self.end,
+      )
+    };
+    Some(Token::from_raw(raw))
+  }
+}
+
+impl ExactSizeIterator for Tokens<'_> {
+  fn len(&self) -> usize {
+    (self.end - self.next).max(0) as usize
+  }
+}
+
+impl core::iter::FusedIterator for Tokens<'_> {}
+
+/// `for seg in &state { ... }` yields the same items as
+/// [`State::segments_iter`]. Provided so the segment
+/// iteration reads as one of Rust's standard collection
+/// idioms.
+impl<'a> IntoIterator for &'a State {
+  type Item = Segment<'a>;
+  type IntoIter = Segments<'a>;
+
+  fn into_iter(self) -> Segments<'a> {
+    self.segments_iter()
+  }
+}
+
+/// `for tok in seg { ... }` yields the same items as
+/// [`Segment::tokens_iter`]. By-value form is cheap
+/// because [`Segment`] is `Copy`.
+impl<'a> IntoIterator for Segment<'a> {
+  type Item = Token;
+  type IntoIter = Tokens<'a>;
+
+  fn into_iter(self) -> Tokens<'a> {
+    self.tokens_iter()
+  }
+}
+
+/// `for tok in &seg { ... }` form, mirroring the
+/// `for x in &collection` idiom. Equivalent to the
+/// by-value impl above (since `Segment` is `Copy`).
+impl<'a> IntoIterator for &Segment<'a> {
+  type Item = Token;
+  type IntoIter = Tokens<'a>;
+
+  fn into_iter(self) -> Tokens<'a> {
+    self.tokens_iter()
   }
 }
 
@@ -992,5 +1259,367 @@ mod tests {
       Some(0),
       "t_dtw == 0 is a valid timestamp (token at audio start), not the sentinel",
     );
+  }
+
+  // ── Iterator tests (issue #3) ────────────────────────────
+  //
+  // All iterator unit tests run on a **poisoned** `State`
+  // (its `ptr` is `None`, so `n_segments()` returns `0` and
+  // `segment(_)` returns `None`). Real-state coverage —
+  // segment counts > 0 and per-segment token streams —
+  // requires a model file and lives in the integration test
+  // suite. The tests here pin the Rust-side iterator
+  // contract: empty-state correctness, `ExactSizeIterator`
+  // length, fused behaviour, and that the borrow chain
+  // composes (multiple iterators alive concurrently, nested
+  // iteration). The compile-only test below proves the
+  // lifetime threading is sound for the non-empty case too.
+
+  /// RAII fixture for iterator tests that need a `State`
+  /// without a real model file. Holds:
+  ///
+  /// * The `State` itself (with `ptr: None`, so `n_segments()
+  ///   == 0` and every accessor early-returns; `State::drop`
+  ///   is a no-op on this branch — `whisper_free_state` is
+  ///   never called).
+  /// * A `ManuallyDrop<Arc<Context>>` that keeps the inner
+  ///   `Context`'s strong count permanently above zero. The
+  ///   `State` field carries its own `Arc<Context>` clone (in
+  ///   its private `ctx` field); when the State drops, that
+  ///   clone decrements 2 → 1, and the leaked clone here
+  ///   keeps the count at 1 forever — so `Context::drop`
+  ///   never runs and the dangling `whisper_context*` never
+  ///   reaches `whisper_free`.
+  ///
+  /// Why a guard instead of a free function + manual
+  /// `mem::forget`: the previous helper-pair design
+  /// (`poisoned_state_for_test` + a separate
+  /// `forget_poisoned_state(state)` cleanup call at every
+  /// test) was fragile against early-return / panic mid-test
+  /// — the cleanup wouldn't run and the held `Arc<Context>`
+  /// could decrement to refcount 0 (calling `Context::drop`
+  /// on the dangling pointer). The `ManuallyDrop` makes the
+  /// leak invariant destructor-managed: even if the test
+  /// panics, the fixture's `Drop` chain still suppresses
+  /// the held Arc's decrement.
+  ///
+  /// Miri note: every fixture instance leaks one `ArcInner`
+  /// (40 bytes) by design — Miri's default leak checker
+  /// correctly flags it. Tests that construct this fixture
+  /// are tagged `#[cfg_attr(miri, ignore = "...")]` so Miri
+  /// skips them; pure compile-time tests (`PhantomData` +
+  /// trait-bound assertions) stay covered.
+  ///
+  /// Implements `Deref<Target = State>` so test code reads
+  /// `fixture.segments_iter()` instead of
+  /// `fixture.state().segments_iter()`. For `IntoIterator`
+  /// tests that need an explicit `&State` (the trait is
+  /// implemented for `&State`, not `&PoisonedStateFixture`),
+  /// use `&*fixture` to take a reborrow through the Deref.
+  struct PoisonedStateFixture {
+    state: State,
+    // Held in a `ManuallyDrop` rather than `mem::forget`'d:
+    // the field's destructor is a no-op (ManuallyDrop's
+    // semantics), so the leak survives test panics /
+    // early-returns without an explicit forget call.
+    _leaked_ctx: core::mem::ManuallyDrop<Arc<Context>>,
+  }
+
+  impl PoisonedStateFixture {
+    fn new() -> Self {
+      // SAFETY: `Context::dangling_for_test` requires the
+      // returned value (or any `Arc<Context>` derived from
+      // it) never reach refcount 0 — otherwise
+      // `Context::drop` would call `whisper_free` on
+      // `NonNull::dangling()`. We satisfy this by storing
+      // an extra clone in `ManuallyDrop`, which suppresses
+      // the contained Arc's decrement on `Drop` (this
+      // fixture's destructor inherits ManuallyDrop's no-op
+      // behaviour for that field).
+      //
+      // The `State { ptr: None, ctx }` literal accesses
+      // `State`'s private fields directly — possible
+      // because `mod tests` is a child of state.rs and
+      // inherits the parent module's privacy boundary.
+      // Inlining here (instead of a free
+      // `State::poisoned_for_test` constructor) keeps the
+      // soundness chain — "the Arc<Context> derived from
+      // an unsafe `dangling_for_test` is consumed by a
+      // safe State constructor" — collapsed into one
+      // auditable point. Per PR #9 review feedback: a
+      // crate-visible safe `poisoned_for_test(arc)` would
+      // propagate the unsafe Arc-leak contract into a
+      // safe API, which is exactly the soundness hole
+      // the reviewer flagged.
+      let ctx = Arc::new(unsafe { Context::dangling_for_test() });
+      let state = State {
+        ptr: None,
+        ctx: Arc::clone(&ctx),
+      };
+      Self {
+        state,
+        _leaked_ctx: core::mem::ManuallyDrop::new(ctx),
+      }
+    }
+  }
+
+  impl core::ops::Deref for PoisonedStateFixture {
+    type Target = State;
+    fn deref(&self) -> &State {
+      &self.state
+    }
+  }
+
+  /// Empty (poisoned) state yields zero segments. Exercises
+  /// the base case the iterator MUST handle: a state whose
+  /// `n_segments()` returned `0`. Anything that yields a
+  /// nonzero count or panics on this input is broken.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn segments_iter_empty_state_yields_zero_items() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    let count = state.segments_iter().count();
+    assert_eq!(count, 0, "poisoned state must yield zero segments");
+  }
+
+  /// Iterator length agrees with `n_segments()`. Pins the
+  /// contract that a future refactor of either side (e.g.
+  /// caching the count differently) can't desynchronise.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn segments_iter_count_matches_n_segments() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    let expected = state.n_segments();
+    assert_eq!(expected, 0, "test fixture is poisoned");
+    let actual = state.segments_iter().count() as i32;
+    assert_eq!(actual, expected);
+  }
+
+  /// `ExactSizeIterator::len()` returns the same value as
+  /// `count()` (and matches `n_segments()`). The
+  /// `len()` impl is what `Vec::from_iter` uses to pre-
+  /// allocate, so a wrong `len()` would either over-allocate
+  /// or panic.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn segments_iter_exact_size_len_matches_count() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    let iter = state.segments_iter();
+    let len_before = iter.len();
+    let counted = iter.count();
+    assert_eq!(len_before, counted);
+    assert_eq!(len_before, 0);
+  }
+
+  /// `size_hint` returns `(len, Some(len))` because the
+  /// segment count is known up-front and never changes
+  /// mid-iteration. Pins the lower bound + upper bound so
+  /// adapters like `Vec::extend` can pre-allocate optimally.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn segments_iter_size_hint_is_exact() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    let iter = state.segments_iter();
+    let (lower, upper) = iter.size_hint();
+    assert_eq!(lower, 0);
+    assert_eq!(upper, Some(0));
+  }
+
+  /// `FusedIterator`: once exhausted, repeat `next()` calls
+  /// keep returning `None` rather than producing items
+  /// again. The `fuse()`-free explicit impl on `Segments`
+  /// promises this — pin it.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn segments_iter_fused_after_exhaustion() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    let mut iter = state.segments_iter();
+    assert!(iter.next().is_none());
+    assert!(iter.next().is_none());
+    assert!(iter.next().is_none());
+  }
+
+  /// Two `Segments` iterators alive simultaneously must not
+  /// fight: both borrow `&self`, and `&self` is `Copy`-able
+  /// at the borrow level (multiple shared references are
+  /// fine). The iterator only mutates its own index counter,
+  /// not any shared state, so this exercises the
+  /// "concurrent reads safe" claim from the doc comment.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn multiple_segments_iter_alive_concurrently() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    let it1 = state.segments_iter();
+    let it2 = state.segments_iter();
+    assert_eq!(it1.len(), it2.len());
+    assert_eq!(it1.count(), 0);
+    assert_eq!(it2.count(), 0);
+  }
+
+  /// Iterator composes with adapters (`map`, `collect`).
+  /// Pins that the trait impl is shaped right for the
+  /// standard library's adapter chain — a common breakage
+  /// when iterator types accidentally pick up unintended
+  /// trait bounds.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn segments_iter_composes_with_adapters() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    let collected: Vec<_> = state.segments_iter().map(|seg| seg.t0()).collect();
+    assert!(collected.is_empty());
+  }
+
+  /// Compile-only: nested iteration `for seg in
+  /// state.segments_iter() { for tok in seg.tokens_iter()
+  /// { ... } }` typechecks. `Tokens<'state>` owns a copy
+  /// of the `Segment`, so the inner loop's iterator does
+  /// not borrow the closure-local `seg` value — adapter
+  /// composition (see
+  /// `tokens_iter_composes_with_flat_map`) works for the
+  /// same reason. This test never executes the inner body
+  /// on the poisoned fixture, but the body is still
+  /// parsed and type-checked.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn nested_segments_and_tokens_iter_compiles() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    let mut total: i32 = 0;
+    for seg in state.segments_iter() {
+      for tok in seg.tokens_iter() {
+        // Use the token so the type-check is real (a no-op
+        // closure body could be elided). On the poisoned
+        // fixture this branch is unreachable.
+        total = total.wrapping_add(tok.id());
+      }
+    }
+    assert_eq!(total, 0);
+  }
+
+  /// Type-shape pin: `Segments` is `Iterator<Item =
+  /// Segment<'_>>` and `Tokens` is `Iterator<Item =
+  /// Token>`. Pin via a function-pointer cast that
+  /// requires the trait bound at the type-system level —
+  /// a future change that broke either bound would fail
+  /// to compile here.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn iterator_type_bounds_are_correct() {
+    fn assert_iter<I: Iterator>(_: I) {}
+    fn assert_exact_size<I: ExactSizeIterator>(_: I) {}
+    fn assert_fused<I: core::iter::FusedIterator>(_: I) {}
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    assert_iter(state.segments_iter());
+    assert_exact_size(state.segments_iter());
+    assert_fused(state.segments_iter());
+  }
+
+  /// Adapter composition: `flat_map` over `segments_iter`
+  /// returning each segment's `tokens_iter` must compile
+  /// and produce a single flat token stream. The previous
+  /// design (`Tokens<'seg, 'state>` borrowing
+  /// `&'seg Segment<'state>`) failed to compile because
+  /// the closure-local `Segment` value goes out of scope
+  /// when the closure returns; the iterator would have
+  /// been a dangling borrow. With `Tokens<'state>` owning
+  /// a `Copy` of the `Segment`, the inner iterator
+  /// outlives the closure and the chain works.
+  ///
+  /// Pin runtime + type behaviour: the poisoned fixture
+  /// yields zero segments, so the flattened stream is
+  /// empty. The type-check is the load-bearing assertion;
+  /// the runtime count is a defense-in-depth check that
+  /// the iterator wires up correctly.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn tokens_iter_composes_with_flat_map() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    let total: usize = state
+      .segments_iter()
+      .flat_map(|seg| seg.tokens_iter())
+      .count();
+    assert_eq!(total, 0);
+    // Also pin Iterator-trait-bound on the flattened
+    // chain. Compile-time check that `flat_map` returns
+    // `Iterator<Item = Token>`.
+    fn assert_token_iter<I: Iterator<Item = Token>>(_: I) {}
+    let fixture2 = PoisonedStateFixture::new();
+    let state2 = &*fixture2;
+    assert_token_iter(state2.segments_iter().flat_map(|seg| seg.tokens_iter()));
+  }
+
+  /// `for seg in &state` works via [`IntoIterator for
+  /// &State`]. Pin the trait shape (rather than the
+  /// runtime count, which is zero on the poisoned
+  /// fixture) so a future change can't quietly drop the
+  /// impl. The compile-time check is the load-bearing
+  /// assertion.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn into_iter_for_state_ref_yields_segments() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    fn assert_segment_iter<'a, I: IntoIterator<Item = Segment<'a>>>(_: I) {}
+    assert_segment_iter(state);
+    let count = state.into_iter().count();
+    assert_eq!(count, 0);
+  }
+
+  /// `Segment: IntoIterator<Item = Token>` (by-value;
+  /// `Segment` is `Copy` so the consumption is cheap)
+  /// and `&Segment: IntoIterator<Item = Token>`. Both are
+  /// type-pinned here. Runtime exercise is impossible
+  /// without a real model (the poisoned fixture yields
+  /// zero segments, so we can't construct a `Segment`).
+  /// The compile-time `assert_token_iter` calls verify
+  /// the trait shape. Regression coverage uses the
+  /// `flat_map` test which already drives the closure
+  /// path.
+  #[test]
+  fn into_iter_for_segment_compiles() {
+    fn assert_token_iter<I: IntoIterator<Item = Token>>(_: PhantomData<I>) {}
+    use core::marker::PhantomData;
+    assert_token_iter::<Segment<'_>>(PhantomData);
+    assert_token_iter::<&Segment<'_>>(PhantomData);
+  }
+
+  /// `DoubleEndedIterator` for `Segments`: `next_back`
+  /// returns segments in reverse index order, and
+  /// `.rev()` chains correctly. Empty fixture means the
+  /// runtime check is "never yields"; the load-bearing
+  /// assertion is the trait-bound on `.rev()`.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in PoisonedStateFixture")]
+  #[test]
+  fn segments_iter_double_ended_compiles_and_empty_yields_none() {
+    let fixture = PoisonedStateFixture::new();
+    let state = &*fixture;
+    fn assert_dei<I: DoubleEndedIterator>(_: I) {}
+    assert_dei(state.segments_iter());
+    let mut iter = state.segments_iter();
+    assert!(iter.next_back().is_none());
+    let rev_count = state.segments_iter().rev().count();
+    assert_eq!(rev_count, 0);
+  }
+
+  /// `DoubleEndedIterator` for `Tokens`: same as above —
+  /// trait shape pinned via `assert_dei` on a Tokens
+  /// instance. Constructing a real `Tokens` without a
+  /// model is impossible (we'd need a `Segment`, which
+  /// requires a non-poisoned `State`), so this is a
+  /// pure type-check.
+  #[test]
+  fn tokens_iter_double_ended_compiles() {
+    fn assert_dei<I: DoubleEndedIterator>(_: PhantomData<I>) {}
+    use core::marker::PhantomData;
+    assert_dei::<Tokens<'_>>(PhantomData);
   }
 }

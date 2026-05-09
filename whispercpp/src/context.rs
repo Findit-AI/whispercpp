@@ -993,6 +993,48 @@ impl Context {
     self.ptr.as_ptr()
   }
 
+  /// Internal test-only constructor. Builds a `Context`
+  /// whose `ptr` is `NonNull::dangling` — useful for unit
+  /// tests that exercise Rust-side logic (e.g. iterator
+  /// drivers on a poisoned `State`) without needing a real
+  /// model file.
+  ///
+  /// # Safety
+  ///
+  /// The returned `Context`'s [`Drop`] impl
+  /// unconditionally invokes `whisper_free(self.ptr.as_ptr())`,
+  /// which would dereference `NonNull::dangling()` — UB. The
+  /// caller MUST guarantee that the returned value (or any
+  /// `Arc<Context>` derived from it) is `core::mem::forget`'d
+  /// before its drop runs. The unsafety is on this
+  /// constructor (not the resulting `Context`) so the
+  /// precondition is enforced at every call site by the
+  /// borrow checker via the `unsafe` block.
+  ///
+  /// `unsafe fn` is preferred over returning
+  /// `ManuallyDrop<Self>` because production code (and the
+  /// `State::poisoned_for_test` helper that consumes this)
+  /// expects an `Arc<Context>`, not an
+  /// `Arc<ManuallyDrop<Context>>`. The two are different
+  /// types — `ManuallyDrop` IS sufficient to suppress the
+  /// inner `Context`'s drop (its destructor is a no-op),
+  /// so the UB itself would be prevented; the issue is
+  /// purely API-shape compatibility with the production
+  /// `Arc<Context>` field on `State`. The
+  /// `PoisonedStateFixture` test guard sidesteps this by
+  /// holding a separate `ManuallyDrop<Arc<Context>>` clone
+  /// alongside the State — the `unsafe fn` here is the
+  /// raw-pointer producer, the guard handles the leak
+  /// invariant via composition.
+  #[cfg(test)]
+  pub(crate) unsafe fn dangling_for_test() -> Self {
+    Self {
+      ptr: NonNull::<sys::whisper_context>::dangling(),
+      lost: AtomicBool::new(false),
+      full_lock: Mutex::new(()),
+    }
+  }
+
   /// Internal: mark this Context as poisoned because a
   /// `State::full` on one of its States returned a
   /// `WhisperError::StateLost`. Subsequent

@@ -5,6 +5,56 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] - 2026-05-09
+
+Closes [#3] (delivered via PR [#9]). Additive release: cargo-compatible
+with `whispercpp = "0.2"` consumers; no changes to `whispercpp-sys` (the
+`-sys` crate stays at `0.2.0`).
+
+### Added
+
+- `Segments<'a>` and `Tokens<'state>` iterator types in `whispercpp::state`,
+  plus `State::segments_iter()` and `Segment::tokens_iter()` constructors.
+  Both implement `Iterator + ExactSizeIterator + DoubleEndedIterator +
+  FusedIterator`.
+- `IntoIterator` impls so the standard collection idioms work:
+  - `for seg in &state { ... }` — `IntoIterator for &State`.
+  - `for tok in seg { ... }` — `IntoIterator for Segment<'a>` (by-value;
+    `Segment` is `Copy`, so the consumption is cheap).
+  - `for tok in &seg { ... }` — `IntoIterator for &Segment<'a>`.
+- `Tokens<'state>` owns a `Copy` of the `Segment` so adapter chains like
+  `state.segments_iter().flat_map(|s| s.tokens_iter())` compile (the inner
+  iterator does not borrow the closure-local `Segment` value).
+
+### Performance
+
+- `Segments::next` and `Tokens::next` inline the construction / pointer
+  projection rather than calling back through `State::segment(i)` /
+  `Segment::token(j)`, saving one `n_segments()` / `n_tokens()` FFI call
+  per yielded item. The iterator's captured `end` plus the `&self` borrow
+  chain (`State::full` requires `&mut self`) make the per-call bounds-check
+  redundant. Dominant on `Tokens` — typical states have hundreds to low
+  thousands of tokens per `State::full` invocation.
+
+### Internal
+
+- New test fixture (`PoisonedStateFixture`) and `Context::dangling_for_test`
+  (`unsafe fn`) so iterator behaviour can be exercised without a real model
+  file. The fixture's RAII guard holds a `ManuallyDrop<Arc<Context>>` clone
+  alongside the State, keeping the `Context` refcount permanently above
+  zero so `whisper_free` is never called on the dangling pointer — the
+  invariant is destructor-managed and survives test panics.
+- `safety_audit.rs` matrix gains a `segments_iter` / `tokens_iter` row
+  walking all ten safety axes; inlined-FFI projection rationale documented
+  under axis #1 (throw).
+
+### Fixed
+
+No bug fixes — this is a feature-only release.
+
+[#3]: https://github.com/Findit-AI/whispercpp/issues/3
+[#9]: https://github.com/Findit-AI/whispercpp/pull/9
+
 ## [0.2.0] - 2026-05-09
 
 Two feature streams (DTW timestamps in [#7], the issue-#2 accessors in [#8])
