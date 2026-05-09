@@ -9,6 +9,7 @@
 
 #include "whispercpp_shim.h"
 
+#include <climits>
 #include <new>
 #include <stdexcept>
 #include <system_error>
@@ -41,6 +42,15 @@
 // thread. There's no observation window where one constructor's
 // exception could be misread as another's.
 static thread_local int g_last_constructor_exception = 0;
+
+// Note: a thread-local `g_last_tokenize_exception` slot
+// previously paired with `whispercpp_take_last_tokenize_exception`
+// to surface the caught-exception class on `INT_MIN` returns
+// from the tokenize shim. Removed when `whispercpp_tokenize`
+// moved to `whisper.cpp` (the no-log refactor in the
+// `whispercpp-sys: no-log tokenize shim` patch). The Rust
+// wrapper drained but never used the class info, and the
+// new shim's `INT_MIN` return is sufficient by itself.
 
 extern "C" {
 
@@ -119,6 +129,29 @@ const char * whispercpp_print_system_info(void)
         return whisper_print_system_info();
     } catch (...) {
         return nullptr;
+    }
+}
+
+// `whispercpp_tokenize`'s implementation lives in
+// `whisper.cpp` alongside the `whispercpp-sys: no-log
+// token count shim` patch — both call the internal
+// `tokenize(vocab, text)` helper that is static-scoped to
+// that translation unit. See the
+// `whispercpp-sys: no-log tokenize shim` comment block in
+// `whisper.cpp` for the contract.
+
+int whispercpp_lang_id(const char * lang)
+{
+    try {
+        return whisper_lang_id(lang);
+    } catch (const std::bad_alloc &) {
+        return WHISPERCPP_ERR_BAD_ALLOC;
+    } catch (const std::system_error &) {
+        return WHISPERCPP_ERR_SYSTEM_ERROR;
+    } catch (const std::exception &) {
+        return WHISPERCPP_ERR_STD_EXCEPTION;
+    } catch (...) {
+        return WHISPERCPP_ERR_UNKNOWN_EXCEPTION;
     }
 }
 

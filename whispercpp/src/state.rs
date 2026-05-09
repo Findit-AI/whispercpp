@@ -134,6 +134,12 @@ impl State {
   ///   indices either trip a CPU-side assert or cause invalid
   ///   memory access in GPU kernels, both of which abort
   ///   across the FFI.
+  /// * [`WhisperError::InvalidDuration`] when the configured
+  ///   `offset_ms` / `duration_ms` describe an audio range
+  ///   extending past the actual sample buffer. Upstream
+  ///   does not bound `seek_end` to the mel length, so an
+  ///   over-large duration drives a long zero-padded decode
+  ///   loop instead of erroring; the wrapper rejects up-front.
   pub fn full(&mut self, params: &Params, samples: &[f32]) -> WhisperResult<()> {
     // `log_mel_spectrogram` runs
     // `reverse_copy(samples + 1, samples + 1 + 200, …)` for its
@@ -173,6 +179,140 @@ impl State {
           });
         }
       }
+    }
+    // Model-bound language preflight. `Params::set_language`
+    // validated against whisper.cpp's process-global
+    // `g_lang` table — that catches typos but accepts
+    // language ids whisper.cpp's table knows about even
+    // when the LOADED MODEL has fewer language-token
+    // slots. `whisper_token_lang(ctx, lang_id)` is a bare
+    // `token_sot + 1 + lang_id` calculation with no bounds
+    // check; if `lang_id` exceeds the model's actual
+    // language-token count the resulting token lands on
+    // `token_translate` / `token_transcribe` / further
+    // special slots and the decoder runs with a corrupted
+    // SOT-style prefix (silently producing wrong-language
+    // or task-biased transcripts).
+    //
+    // Skip the check when:
+    //   * Hint is empty / "auto" (auto-detect sentinels).
+    //   * `params.detect_language` is true — upstream
+    //     ignores `params.language` in this mode and runs
+    //     language detection on the audio. A stale or
+    //     model-incompatible hint is harmless.
+    //
+    // Otherwise, the validation depends on whether the
+    // loaded model is multilingual:
+    //
+    // * Multilingual: the resolved
+    //   `whisper_token_lang(ctx, lang_id)` must lie in
+    //   `(token_sot, token_translate)` — the model's
+    //   actual language-token range.
+    //
+    // * English-only checkpoint (`.en` suffix; no language
+    //   tokens at all): upstream's
+    //   `whisper_full_with_state` only pushes a `<|lang|>`
+    //   token inside `if (is_multilingual)`. So
+    //   `params.language = "en"` (id 0) is a no-op accept
+    //   on `.en` models. Non-English hints, however,
+    //   indicate caller confusion (the model can't
+    //   actually transcribe Chinese / French / etc.) — we
+    //   reject with `LanguageNotSupportedByModel` so the
+    //   bad config surfaces early instead of silently
+    //   producing English output.
+    let lang_opt = params.language();
+    let auto_detect = params.detect_language()
+      || match lang_opt {
+        None => true,
+        Some(s) => s.is_empty() || s == "auto",
+      };
+    if auto_detect {
+      // Auto-detect path. Upstream's
+      // `whisper_lang_auto_detect_with_state` loop iterates
+      // every `g_lang` entry and reads
+      // `state->logits[whisper_token_lang(ctx, id)]` with no
+      // bound against `vocab.num_languages()`. The
+      // submodule's `auto-detect bounded to model lang
+      // range` patch filters the candidate set so an
+      // out-of-range id can no longer be selected; this
+      // wrapper-level guard rejects the case the patch
+      // can't recover (no language tokens at all) with a
+      // typed error instead of upstream's bare `-3`.
+      //
+      // English-only checkpoints (`is_multilingual()`
+      // false) have no language tokens; auto-detect would
+      // score regular vocabulary tokens. Reject up-front.
+      if !self.ctx.is_multilingual() {
+        return Err(WhisperError::LanguageNotSupportedByModel(
+          smol_str::SmolStr::new_static("auto"),
+        ));
+      }
+    } else if let Some(lang) = lang_opt {
+      let model_supports = if let Some(lang_id) = crate::lang::lang_id_for(lang) {
+        if self.ctx.is_multilingual() {
+          // SAFETY: pure C addition; no allocation.
+          let token = unsafe { sys::whisper_token_lang(self.ctx.as_raw(), lang_id) };
+          let sot = self.ctx.token_sot();
+          // SAFETY: pure C read of vocab field.
+          let translate = unsafe { sys::whisper_token_translate(self.ctx.as_raw()) };
+          token > sot && token < translate
+        } else {
+          // English-only model — only English (id 0,
+          // matching `"en"` and `"english"`) is a valid
+          // no-op accept. Other languages would be
+          // silently ignored upstream, but their presence
+          // signals likely caller confusion.
+          lang_id == 0
+        }
+      } else {
+        // Unknown language. `set_language` should have
+        // rejected this already; defend against
+        // `Default + struct update` bypassing the setter.
+        false
+      };
+      if !model_supports {
+        return Err(WhisperError::LanguageNotSupportedByModel(
+          smol_str::SmolStr::new(lang),
+        ));
+      }
+    }
+    // duration_ms / offset_ms range preflight. Upstream's
+    // `whisper_full_with_state` computes
+    //   seek_end = params.duration_ms == 0
+    //              ? whisper_n_len_from_state(state)
+    //              : seek_start + params.duration_ms / 10;
+    // (`src/whisper.cpp:7442`) and runs the encoder/decoder
+    // loop over `[seek_start, seek_end)` without bounding
+    // `seek_end` to the actual mel length. Reads past the
+    // real input are silently zero-filled by
+    // `whisper_encode_internal`, so an `i32::MAX` duration
+    // on a short buffer drives ~71 000 thirty-second
+    // windows of zero-padded decode — looks like a hung
+    // worker rather than a clean parameter error.
+    //
+    // The setter clamps to `>= 0`, but `Params::default()`
+    // followed by a struct-update could bypass it; defend
+    // here. `duration_ms == 0` is upstream's "to end of
+    // input" sentinel and is always accepted. Negative
+    // values (only reachable via the bypass) are rejected.
+    //
+    // Audio length in ms: integer-truncated
+    // `samples.len() * 1000 / 16000`. Computed in i64 to
+    // avoid overflow at the i32::MAX-sample upper bound the
+    // earlier `SamplesOverflow` check already enforces.
+    let offset_ms = i64::from(params.offset_ms());
+    let duration_ms = i64::from(params.duration_ms());
+    let audio_duration_ms = (samples.len() as i64) * 1000 / 16_000;
+    if offset_ms < 0
+      || duration_ms < 0
+      || (duration_ms > 0 && offset_ms.saturating_add(duration_ms) > audio_duration_ms)
+      || (duration_ms == 0 && offset_ms > audio_duration_ms)
+    {
+      return Err(WhisperError::InvalidDuration {
+        offset_ms: params.offset_ms(),
+        duration_ms: params.duration_ms(),
+        audio_duration_ms,
+      });
     }
     // Poisoned state can't run inference — the C-side pointer
     // is gone. Surface this as `StateLost` so callers can
@@ -330,6 +470,96 @@ impl State {
     let Some(state) = self.raw() else { return 0 };
     // SAFETY: state non-null; pure read.
     unsafe { sys::whisper_full_n_segments_from_state(state) }
+  }
+
+  /// Number of mel-spectrogram frames in the audio that the
+  /// most recent [`State::full`] call processed. One frame =
+  /// 10 ms of input audio (whisper's mel hop).
+  ///
+  /// Returns `0` for a poisoned state or when no inference
+  /// has run yet on this state. Wraps
+  /// `whisper_n_len_from_state`.
+  pub fn n_mel_frames(&self) -> i32 {
+    let Some(state) = self.raw() else { return 0 };
+    // SAFETY: state non-null; pure read of an int field on
+    // the state's mel struct, no allocation, no throw. The
+    // `whisper_mel POD field default-init` patch in the
+    // submodule guarantees this read is well-defined even
+    // before any `State::full` has run.
+    unsafe { sys::whisper_n_len_from_state(state) }
+  }
+
+  /// Print this `State`'s timing breakdown to stderr
+  /// (load / fallbacks / mel / sample / encode / decode /
+  /// batchd / prompt). Wraps the patched
+  /// `whispercpp_print_timings_with_state(ctx, state)`
+  /// (the upstream `whisper_print_timings(ctx)` reads
+  /// `ctx->state` only, which is always null in this wrapper
+  /// because `Context::new` uses the `_no_state`
+  /// initializer).
+  ///
+  /// Output diverges from upstream in one place: the
+  /// "total time" line (upstream's `ggml_time_us() -
+  /// ctx->t_start_us`) is omitted. `t_start_us` is
+  /// Context-shared in this wrapper's
+  /// `Arc<Context>` + multiple-`State` pattern; pairing
+  /// it with state-bound counters that
+  /// [`Self::reset_timings`] can zero would produce
+  /// internally inconsistent output (per-stage values at
+  /// 0 alongside a non-zero "total" that started at
+  /// Context init). The state-aware printer therefore
+  /// emits only state-bound counters plus the load-time
+  /// read from `ctx->t_load_us` (immutable after
+  /// `whisper_init_*`).
+  ///
+  /// Safe under shared `&self` because `State` is
+  /// `Send`-but-not-`Sync`; no two threads can hold `&self`
+  /// to the same `State` simultaneously, so the
+  /// `state->n_*` / `state->t_*` reads can't race with a
+  /// concurrent writer (`State::full` requires `&mut self`).
+  /// No-op for a poisoned state.
+  pub fn print_timings(&self) {
+    let Some(state) = self.raw() else { return };
+    let ctx = self.ctx.as_raw();
+    // SAFETY: ctx and state are both non-null. The patched
+    // shim re-implements upstream's print logic against the
+    // passed `state` (instead of `ctx->state`); only writes
+    // to stderr, no allocation, no throw.
+    unsafe { sys::whispercpp_print_timings_with_state(ctx, state) };
+  }
+
+  /// Reset this `State`'s timing accumulators (encode /
+  /// decode / sample / mel / batchd / prompt counters and
+  /// elapsed-time totals). Wraps the patched
+  /// `whispercpp_reset_timings_with_state(state)`.
+  ///
+  /// Scope: state-bound only. Does NOT touch
+  /// `ctx->t_start_us` (the Context-shared timestamp
+  /// upstream's `whisper_reset_timings` rebases). In the
+  /// wrapper's `Arc<Context>` + multiple-`State` pattern
+  /// rebasing that field from one State would silently
+  /// invalidate any sibling State's wall-clock readings on
+  /// the same Context, and would race against concurrent
+  /// `print_timings` calls on those siblings. The matching
+  /// [`Self::print_timings`] omits the total-time line for
+  /// the same reason, so the post-reset output stays
+  /// internally consistent (every line either reset or
+  /// load-time).
+  ///
+  /// Useful when the same `State` is reused across multiple
+  /// distinct runs and you want per-run numbers. Safe under
+  /// `&mut self` exclusive access — `State` is
+  /// `Send`-but-not-`Sync`, so the borrow checker prevents
+  /// any concurrent reader (`Self::print_timings`) or writer
+  /// (`Self::full`) from observing a mid-write state.
+  /// No-op for a poisoned state.
+  pub fn reset_timings(&mut self) {
+    let Some(state) = self.raw() else { return };
+    // SAFETY: state non-null. The shim writes integer
+    // fields on the state's accumulator struct; no
+    // allocation, no throw. `&mut self` ensures no other
+    // method on this `State` runs concurrently.
+    unsafe { sys::whispercpp_reset_timings_with_state(state) };
   }
 
   /// Borrow segment `idx` (0-indexed). Returns `None` for a

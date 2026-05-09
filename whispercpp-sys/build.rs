@@ -209,6 +209,130 @@ fn verify_patched_source(whisper_src: &Path) {
     ),
     ("src/whisper.cpp", "whispercpp-sys: dtw t_dtw sentinel init"),
     (
+      "src/whisper.cpp",
+      "whispercpp-sys: whisper_mel POD field default-init",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: state-aware timing entry points",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: state-aware print drops total time",
+    ),
+    ("src/whisper.cpp", "whispercpp-sys: log_internal va_copy"),
+    ("src/whisper.cpp", "whispercpp-sys: no-log token count shim"),
+    ("src/whisper.cpp", "whispercpp-sys: no-log tokenize shim"),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: tokenize size_t→int overflow guard",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: whisper_tokenize size_t→int overflow guard",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: whisper_tokenize INT_MIN propagation",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: whisper_token_count INT_MIN propagation",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: gallocr_new_n OOM-safe alloc",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: gallocr_reserve_n_impl OOM-safe paths",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: dyn_tallocr_new OOM-safe alloc",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: dyn_tallocr_alloc OOM-safe sentinel",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: gallocr alloc-failure flag",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: gallocr_free_node invalid-chunk guard",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: hash_set / hash_values atomic commit",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: node_allocs growth transactional",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: leaf_allocs growth transactional",
+    ),
+    (
+      "ggml/src/ggml-alloc.c",
+      "whispercpp-sys: vbuffer realloc transactional",
+    ),
+    (
+      "ggml/src/ggml-backend.cpp",
+      "whispercpp-sys: sched_alloc_splits reserve_n return check",
+    ),
+    ("src/whisper.cpp", "whispercpp-sys: backend_init RAII"),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: sched_graph_init NULL guard",
+    ),
+    (
+      "ggml/src/ggml-backend.cpp",
+      "whispercpp-sys: backend_sched_new OOM-safe alloc",
+    ),
+    (
+      "ggml/src/ggml-backend.cpp",
+      "whispercpp-sys: hash_set_new OOM-safe alloc",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: vocab count consistency check",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: vocab post-synthesis size check",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: model_load RAII for raw ggml allocations",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: model_load tensor-prep RAII",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: model_load buffer-registration RAII",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: vad_load RAII for raw ggml allocations",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: vad_load tensor-prep RAII",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: vad_load buffer-registration RAII",
+    ),
+    (
+      "src/whisper.cpp",
+      "whispercpp-sys: auto-detect bounded to model lang range",
+    ),
+    (
       "ggml/src/ggml.c",
       "whispercpp-sys: ggml_init OOM-safe context alloc",
     ),
@@ -580,6 +704,47 @@ fn generate_bindings_with_args(clang_args: &[String]) {
     .allowlist_function("whisper_full_get_segment_speaker_turn_next_from_state")
     .allowlist_function("whisper_full_n_tokens_from_state")
     .allowlist_function("whisper_full_get_token_data_from_state")
+    // Issue #2 accessors — no-throw plain reads of vocab /
+    // hparams / static const tables. Each was audited by
+    // reading whisper.cpp's source for the symbol; functions
+    // that touched `std::vector` / `std::string` allocations
+    // (e.g. `whisper_tokenize`) go through a `whispercpp_*`
+    // shim instead.
+    .allowlist_function("whisper_version")
+    .allowlist_function("whisper_lang_max_id")
+    // `whisper_lang_id` is intentionally NOT exposed: it
+    // does `g_lang.count(const char *)` / `.at(const char *)`
+    // which implicitly constructs a `std::string` from the
+    // C string, throwing `std::bad_alloc` under memory
+    // pressure. Safe Rust must go through the
+    // `whispercpp_lang_id` shim instead.
+    .allowlist_function("whisper_lang_str_full")
+    .allowlist_function("whisper_n_len_from_state")
+    .allowlist_function("whisper_model_n_audio_state")
+    .allowlist_function("whisper_model_n_audio_head")
+    .allowlist_function("whisper_model_n_audio_layer")
+    .allowlist_function("whisper_model_n_text_state")
+    .allowlist_function("whisper_model_n_text_head")
+    .allowlist_function("whisper_model_n_text_layer")
+    .allowlist_function("whisper_model_n_mels")
+    .allowlist_function("whisper_model_ftype")
+    .allowlist_function("whisper_token_translate")
+    .allowlist_function("whisper_token_transcribe")
+    .allowlist_function("whisper_token_prev")
+    .allowlist_function("whisper_token_nosp")
+    .allowlist_function("whisper_token_not")
+    .allowlist_function("whisper_token_solm")
+    .allowlist_function("whisper_token_lang")
+    // `whisper_print_timings(ctx)` / `whisper_reset_timings(ctx)`
+    // are intentionally NOT exposed: both upstream
+    // implementations only operate on `ctx->state`, but the
+    // wrapper loads contexts via `_no_state` so `ctx->state`
+    // is always nullptr. Safe Rust uses the state-aware
+    // `whispercpp_print_timings_with_state` /
+    // `whispercpp_reset_timings_with_state` shims (in
+    // `whisper.cpp` under the `state-aware timing entry
+    // points` patch) instead — exposed via `State::print_timings`
+    // and `State::reset_timings`.
     // ggml's logger setter is referenced from our context
     // init lock comment but not directly called. We expose
     // the whole ggml_log_* family for diagnostic use.

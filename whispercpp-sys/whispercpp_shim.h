@@ -115,6 +115,91 @@ int whispercpp_full_with_state(
 /// across the C ABI. Returns NULL on any caught exception.
 const char * whispercpp_print_system_info(void);
 
+/// No-log tokenize, count-or-write.
+///
+/// Calls whisper.cpp's internal `tokenize(vocab, text)`
+/// directly — bypasses the public `whisper_tokenize`'s
+/// "too many tokens" `WHISPER_LOG_ERROR` so callers can
+/// retry-on-too-small without polluting production logs.
+/// The intended caller pattern in safe Rust is "try with
+/// generous initial capacity; if the return is negative,
+/// allocate `-return` and retry." Single upstream
+/// tokenization on the happy path; two only on retry.
+///
+/// Return contract:
+///
+/// * `>= 0` — number of tokens written to `tokens` on
+///   success.
+/// * `< 0` and `> INT_MIN` —
+///   `-(needed_count)` (buffer too small).
+/// * `INT_MIN` — caught C++ exception
+///   (`std::bad_alloc` under memory pressure, etc.).
+///
+/// The exception sentinel is `INT_MIN` (not the shared
+/// `WHISPERCPP_ERR_*` ladder) so it cannot collide with any
+/// realistic `-needed_count` value — no realistic decode
+/// produces 2³¹ tokens.
+int whispercpp_tokenize(
+    struct whisper_context * ctx,
+    const char * text,
+    whisper_token * tokens,
+    int n_max_tokens);
+
+/// No-log token-count probe.
+///
+/// Calls whisper.cpp's internal `tokenize(vocab, text)`
+/// directly — bypasses the public `whisper_tokenize`'s
+/// "too many tokens" `WHISPER_LOG_ERROR` that would
+/// otherwise fire on every non-empty probe-with-NULL-buffer
+/// call. Returns the token count on success, or `INT_MIN`
+/// on caught C++ exception.
+int whispercpp_token_count(struct whisper_context * ctx, const char * text);
+
+/// State-aware print/reset timing entry points.
+///
+/// Upstream `whisper_print_timings(ctx)` and
+/// `whisper_reset_timings(ctx)` only read/reset
+/// `ctx->state` — but the whispercpp Rust wrapper loads
+/// contexts via `whispercpp_init_from_file_no_state` (so
+/// `ctx->state == nullptr`) and runs inference through
+/// separately-allocated `whisper_state` instances. The
+/// legacy `whisper_*_timings` variants therefore observe
+/// nothing useful in this configuration. These two
+/// `_with_state` variants take an explicit
+/// `whisper_state *` so the safe Rust `State::print_timings`
+/// / `reset_timings` accessors route to the actually-active
+/// state.
+///
+/// Both are no-throw: `_print_timings_with_state` only
+/// calls `WHISPER_LOG_INFO` (fprintf-shaped, no allocation
+/// in the format path); `_reset_timings_with_state` only
+/// writes integer fields. No try/catch needed but exposed
+/// here as `whispercpp_*` for the safe wrapper to address.
+void whispercpp_print_timings_with_state(
+    struct whisper_context * ctx,
+    struct whisper_state * state);
+void whispercpp_reset_timings_with_state(struct whisper_state * state);
+
+/// `whisper_lang_id` wrapped in try/catch.
+///
+/// Upstream `whisper_lang_id` does
+/// `g_lang.count(lang)` / `g_lang.at(lang)` with a
+/// `const char *` key — both implicitly construct a
+/// temporary `std::string` from the C string, which can
+/// throw `std::bad_alloc`. The unknown-language log path
+/// can also allocate. A throw across the `extern "C"`
+/// boundary into Rust is undefined behaviour.
+///
+/// Return contract:
+///
+/// * `>= 0` — language id (success).
+/// * `-1` — language not found (passthrough from upstream).
+/// * `WHISPERCPP_ERR_BAD_ALLOC` / `..._SYSTEM_ERROR` /
+///   `..._STD_EXCEPTION` / `..._UNKNOWN_EXCEPTION` —
+///   caught C++ exception. These sit at `-100..=-103`,
+///   distinct from the `-1` "not found" sentinel.
+int whispercpp_lang_id(const char * lang);
+
 #ifdef __cplusplus
 }
 #endif

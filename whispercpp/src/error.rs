@@ -36,24 +36,66 @@ pub enum WhisperError {
     /// Path the caller passed in. Stored so logs can pinpoint
     /// which model file failed.
     path: SmolStr,
-    /// Any extra context whisper.cpp surfaced (often empty —
-    /// the C API just returns NULL).
+    /// Any extra context whisper.cpp surfaced. Set to one of
+    /// a small set of `&'static str` values via
+    /// `SmolStr::new_static`, never `format!` — this error
+    /// is reached on the `bad_alloc` / `system_error` path,
+    /// and the `format!` macro plus
+    /// `SmolStr::new(formatted_string)` would each
+    /// heap-allocate while the global allocator is already
+    /// under pressure.
     reason: SmolStr,
+    /// Constructor exception sentinel from the C++ shim.
+    /// `Some(WHISPERCPP_ERR_*)` when the shim caught a
+    /// throw; `None` when upstream returned NULL via its
+    /// own bool-failure path. Kept as a separate `Option<i32>`
+    /// (instead of formatted into `reason`) so error
+    /// construction allocates nothing on the
+    /// caught-exception branch.
+    code: Option<i32>,
   },
 
-  /// `whisper_init_state` returned `NULL` **without** unwinding
-  /// a C++ exception. Usually an OOM on the compute buffers
-  /// reported via the bool-returning failure path (encode
-  /// allocates the largest one).
+  /// `whisper_init_state` failed to produce a usable state.
   ///
-  /// **Retryable.** Upstream cleans up partials on this path
-  /// (every `if (!whisper_kv_cache_init(...))` branch calls
-  /// `whisper_free_state(state); return nullptr;`).
+  /// Two underlying paths land here:
   ///
-  /// The exception-caught counterpart is
-  /// [`ConstructorLost`](Self::ConstructorLost).
-  #[error("failed to allocate whisper state")]
-  StateInit,
+  /// * Clean NULL — an internal `bool`-returning sub-init
+  ///   (e.g. `whisper_kv_cache_init`, `whisper_sched_graph_init`)
+  ///   reported failure. Upstream's fail branch already
+  ///   ran `whisper_free_state(state); return nullptr;`.
+  ///   `code = None`.
+  ///
+  /// * Caught C++ exception — `whisper_init_state` threw
+  ///   (`std::bad_alloc`, `std::system_error`, etc.); the
+  ///   `init_state RAII exit` patch in the submodule caught
+  ///   it, ran `whisper_free_state(state)`, then rethrew;
+  ///   the shim caught the rethrow and stored a sentinel.
+  ///   `code = Some(...)`.
+  ///
+  /// Both paths leave **no native allocation leaked**.
+  ///
+  /// **Retryable.** Callers may try again immediately
+  /// (recoverable system pressure) or fall back to a
+  /// different backend / smaller model. The Context is NOT
+  /// poisoned by this error; sibling States and subsequent
+  /// `create_state` calls are unaffected.
+  // The `{code:?}` formatter uses `Option<i32>`'s Debug impl,
+  // which `write!`s "Some(N)" / "None" without heap allocation.
+  // Earlier versions used `code.map(|c| format!(...))` inside
+  // the format string; that allocates at Display time, on
+  // exactly the OOM path the variant reports. Keep this
+  // allocation-free at both construction and Display.
+  #[error("failed to allocate whisper state (sentinel: {code:?})")]
+  StateInit {
+    /// Optional shim sentinel from the catch block when the
+    /// init path threw (one of `WHISPERCPP_ERR_BAD_ALLOC`,
+    /// `_SYSTEM_ERROR`, `_STD_EXCEPTION`,
+    /// `_UNKNOWN_EXCEPTION` from `crate::sys` — the wildcard
+    /// in the constant name prevents an intra-doc link, hence
+    /// the verbatim spelling). `None` means the bool-failure
+    /// path (no exception thrown).
+    code: Option<i32>,
+  },
 
   /// `Context::create_state` was called on a `Context` whose
   /// previous [`State::full`](crate::State::full) returned
@@ -78,33 +120,56 @@ pub enum WhisperError {
   #[error("Context was poisoned by a prior StateLost; drop and reconstruct to recover")]
   ContextPoisoned,
 
-  /// **The native init path threw a C++ exception that our
-  /// shim caught.** Either
-  /// [`whispercpp_init_from_file_no_state`](crate::sys::whispercpp_init_from_file_no_state)
-  /// or
-  /// [`whispercpp_init_state`](crate::sys::whispercpp_init_state)
-  /// returned `nullptr` AFTER catching `std::bad_alloc` /
-  /// `std::system_error` / `std::exception` / unknown.
+  /// **The native init path threw a C++ exception WITHOUT a
+  /// matching RAII cleanup.** Reserved for the case where
+  /// the shim caught an exception and partial native
+  /// allocations are known to be leaked.
   ///
-  /// **Not retryable.** Upstream `whisper_init_state` /
-  /// `whisper_init_from_file_with_params_no_state` allocate
-  /// raw `whisper_state` / `whisper_context` objects and
-  /// per-backend buffers BEFORE doing the throwing
-  /// model/backend/KV-cache work. Those locals are not
-  /// RAII-owned: a caught throw partway through leaks the
-  /// partial allocation (state struct + every backend / cache
-  /// already initialised — typically tens to hundreds of MB
-  /// per attempt).
+  /// **Unreachable under the stock build.** Both
+  /// constructor paths are now leak-clean:
   ///
-  /// **Recovery contract.** Surface this as a fatal worker /
-  /// process error. Do not auto-recreate the [`Context`](crate::Context) /
-  /// [`State`](crate::State) inside a retry loop on the same process —
-  /// each attempt under the same memory / system pressure
-  /// leaks again. The recommended response is to escalate to
-  /// the supervisor and let the worker process recycle. A
-  /// future round of upstream patches that wraps the init
-  /// paths in RAII would let us downgrade some of these to
-  /// `ContextLoad` / `StateInit`.
+  /// * [`Context::new`](crate::Context::new) — the
+  ///   submodule's `init_context RAII exit` patch reclaims
+  ///   `ctx`-tracked allocations (`model.ctxs`,
+  ///   `model.buffers`, `state`), and the per-pointer
+  ///   guards (`model_load RAII for raw ggml allocations`,
+  ///   `model_load tensor-prep RAII`,
+  ///   `model_load buffer-registration RAII`) wrap each
+  ///   raw `ggml_context*` / backend buffer until
+  ///   ownership is committed to a structure
+  ///   `whisper_free` walks. Every caught exception
+  ///   surfaces as [`ContextLoad`](Self::ContextLoad)
+  ///   with the sentinel embedded in `reason`.
+  ///
+  /// * [`Context::create_state`](crate::Context::create_state)
+  ///   — `whisper_init_state`'s `init_state RAII exit`
+  ///   patch is genuinely complete: every allocation lives
+  ///   inside the captured `state`, and
+  ///   `whisper_free_state(state)` walks every field
+  ///   (the `kv_cache_free idempotent fix` plus
+  ///   default-zero scalars in `whisper_state` make
+  ///   partial-state cleanup safe). Caught exceptions
+  ///   surface as
+  ///   [`StateInit { code: Some(...) }`](Self::StateInit).
+  ///
+  /// The variant is retained for two reasons:
+  ///
+  /// 1. **Defensive type for future regressions.** A
+  ///    future upstream rebase that drops one of the
+  ///    `*_RAII_exit` patches or the per-pointer guards
+  ///    can re-enable this classification without an API
+  ///    change.
+  /// 2. **Out-of-tree builds.** Consumers patching their
+  ///    own submodule may disable some guards; the variant
+  ///    keeps the leak-tainted recovery contract
+  ///    available.
+  ///
+  /// **Recovery contract (when produced).** Surface as a
+  /// fatal worker / process error. Do not auto-recreate
+  /// the [`Context`](crate::Context) /
+  /// [`State`](crate::State) in a retry loop on the same
+  /// process — each attempt under the same pressure leaks
+  /// again. Escalate and recycle the worker.
   #[error(
     "whisper.cpp init threw {origin} (sentinel {code}); native partial allocation leaked, \
      not retryable"
@@ -118,6 +183,24 @@ pub enum WhisperError {
     /// `WHISPERCPP_ERR_BAD_ALLOC`, `_SYSTEM_ERROR`,
     /// `_STD_EXCEPTION`, `_UNKNOWN_EXCEPTION`).
     code: i32,
+  },
+
+  /// A Rust-side allocation on the FFI input copy path failed.
+  /// Surfaced by public setters that copy unbounded
+  /// caller-controlled data (`set_initial_prompt`,
+  /// `set_tokens`) — they pre-scan for invariants and use
+  /// `Vec::try_reserve_exact` so allocation pressure becomes
+  /// a typed error instead of a process abort.
+  ///
+  /// **Retryable** in the same sense as
+  /// [`StateInit`](Self::StateInit): the failure is system
+  /// state, not data, and a smaller payload may succeed.
+  #[error("rust-side allocation failed for {context}")]
+  AllocationFailed {
+    /// Which input the wrapper was trying to copy when the
+    /// allocator returned an error. Static string so the
+    /// error variant carries no further heap allocation.
+    context: &'static str,
   },
 
   /// `whisper_full_with_state` returned a non-zero, **non-fatal**
@@ -181,6 +264,110 @@ pub enum WhisperError {
   /// byte. The whisper.cpp C API requires NUL-terminated strings.
   #[error("argument contained an interior NUL byte: {0}")]
   InvalidCString(SmolStr),
+
+  /// A safe-API setter rejected an input that exceeded its
+  /// length cap. Distinct from [`InvalidCString`](Self::InvalidCString)
+  /// (which is specifically about interior NUL bytes), so callers
+  /// can distinguish "your string is too long" from "your string
+  /// has a NUL embedded in it" without parsing error messages.
+  ///
+  /// The payload carries:
+  /// * a UTF-8 prefix of the offending input (truncated to a
+  ///   bounded head — typically ≤ 64 chars, ≤ 256 bytes — so
+  ///   `Display` can't be turned into log amplification by
+  ///   attacker-controlled values);
+  /// * `len` — the raw input length in bytes;
+  /// * `cap` — the cap the setter enforced.
+  ///
+  /// Currently emitted by:
+  /// * [`Params::set_language`](crate::Params::set_language) —
+  ///   cap is 32 bytes (matches [`crate::lang_id_for`]'s cap);
+  /// * [`Params::set_initial_prompt`](crate::Params::set_initial_prompt)
+  ///   — cap is 1 MiB.
+  #[error("input exceeds length cap ({len} > {cap}): {head:?}")]
+  InputTooLong {
+    /// Bounded UTF-8 head of the offending input (for diagnostics).
+    head: SmolStr,
+    /// Raw byte length of the input.
+    len: usize,
+    /// The cap the setter enforced.
+    cap: usize,
+  },
+
+  /// A language hint passed to
+  /// [`Params::set_language`](crate::Params::set_language)
+  /// was not recognised by whisper.cpp's `whisper_lang_id`
+  /// lookup. `whisper_full_with_state` would otherwise
+  /// silently fall back to id `-1` and push
+  /// `whisper_token_lang(ctx, -1)` into the decoder prompt
+  /// — producing wrong transcripts with no error signal.
+  /// The wrapper validates at the setter so a config typo
+  /// surfaces as `Err` immediately.
+  ///
+  /// The empty string `""` and `"auto"` are accepted as
+  /// "no language hint / auto-detect" sentinels and do
+  /// NOT produce this error.
+  #[error(
+    "unknown language hint {0:?}; expected ISO-639-1 short code, English name, \"\", or \"auto\""
+  )]
+  UnknownLanguage(SmolStr),
+
+  /// A language hint was recognised by whisper.cpp's
+  /// process-global `g_lang` table but is NOT supported by
+  /// the loaded model. `whisper_token_lang(ctx, lang_id)`
+  /// computes `token_sot + 1 + lang_id` without bounds-
+  /// checking against the model's actual language-token
+  /// range — for a checkpoint with fewer language tokens
+  /// than `g_lang` has entries (e.g. `g_lang` includes
+  /// `yue` at id 99 but the model has only 99 language
+  /// tokens at ids 0..=98), the resulting token lands on
+  /// `token_translate` / `token_transcribe` / further
+  /// special-token slots instead of a real language token.
+  ///
+  /// The decode then runs with a corrupted SOT-style
+  /// prefix (the token says "translate to English" or
+  /// "transcribe" instead of "language X"), producing
+  /// wrong-language or task-biased transcripts with no
+  /// other signal. The wrapper validates that the
+  /// resolved token sits in `(token_sot, token_translate)`
+  /// and reports this error instead.
+  #[error(
+    "language {0:?} is not supported by the loaded model — \
+     resolved token falls outside the language-token range"
+  )]
+  LanguageNotSupportedByModel(SmolStr),
+
+  /// `Params::set_offset_ms` / `set_duration_ms` requested an
+  /// audio range (`offset_ms .. offset_ms + duration_ms`)
+  /// extending past the actual audio length. Upstream
+  /// `whisper_full_with_state` doesn't bound `seek_end` to
+  /// the available mel length — it computes
+  /// `seek_end = seek_start + duration_ms / 10` and runs
+  /// the encode/decode loop over that range, with
+  /// `whisper_encode_internal` zero-filling reads past the
+  /// real input. A `duration_ms = i32::MAX` slip on a
+  /// short sample buffer therefore drives ~71 000
+  /// 30-second windows of zero-padded decode work — looks
+  /// like a hung inference rather than a clean parameter
+  /// error.
+  ///
+  /// The wrapper validates at `State::full` entry where
+  /// both `samples.len()` and `Params::offset_ms` /
+  /// `duration_ms` are visible.
+  #[error(
+    "duration_ms range out of bounds: offset_ms={offset_ms}, duration_ms={duration_ms}, \
+     audio_duration_ms={audio_duration_ms}"
+  )]
+  InvalidDuration {
+    /// The configured start offset (ms).
+    offset_ms: i32,
+    /// The configured duration (ms). 0 means "to end of input"
+    /// and is always accepted.
+    duration_ms: i32,
+    /// The actual audio length in ms (`samples.len() * 1000
+    /// / 16000`, integer-truncated).
+    audio_duration_ms: i64,
+  },
 
   /// UTF-8 decode failure on a string returned from whisper.cpp
   /// (segment text or token text). The model vocabulary should
