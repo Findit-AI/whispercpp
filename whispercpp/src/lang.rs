@@ -1,6 +1,7 @@
 //! `Lang` — typed enum over whisper.cpp's supported languages, with
 //! an `Other(SmolStr)` escape hatch for unknown ISO codes.
 
+use crate::sys;
 use smol_str::SmolStr;
 
 /// Language code. Marked `#[non_exhaustive]` so new variants can be
@@ -467,6 +468,131 @@ impl Lang {
       _ => return None,
     })
   }
+
+  /// Human-readable English name for this language
+  /// (`"english"` for `Lang::En`, `"chinese"` for `Lang::Zh`,
+  /// etc.). Wraps `whisper_lang_str_full`, which reads from
+  /// a static const `std::map<std::string, std::pair<int,
+  /// std::string>> g_lang` inside whisper.cpp.
+  ///
+  /// Returns `None` when:
+  /// * the variant is `Lang::Other(...)` with a code
+  ///   whisper.cpp doesn't recognise;
+  /// * the language code contains an interior NUL byte
+  ///   (rejected at the [`lang_id_for`] CString conversion);
+  /// * whisper.cpp's table returns NULL or non-UTF-8 (model
+  ///   corruption / build issue).
+  ///
+  /// **Returns `Option<SmolStr>` (owned), not `&'static str`,
+  /// despite `g_lang` being a static-storage object.** The
+  /// pointer the C function hands us comes from
+  /// `kv.second.second.c_str()` — the buffer is owned by a
+  /// `std::string` member of `g_lang`, not an immortal C
+  /// string literal. Treating that storage as Rust
+  /// `'static` would let safe callers retain it across the
+  /// `std::map`'s static-destructor cleanup at process exit
+  /// (or — should the build ever switch to dynamic linking
+  /// — across `dlclose`). Copying into an owned [`SmolStr`]
+  /// (≤23 bytes inline; all whisper language names fit) ties
+  /// the Rust lifetime to the caller's Rust ownership rather
+  /// than to a C++ static destruction order we don't
+  /// control.
+  pub fn full_name(&self) -> Option<SmolStr> {
+    let lang_id = lang_id_for(self.as_str())?;
+    // SAFETY: pure C accessor reading from `g_lang`. We do
+    // NOT retain the returned pointer past this function's
+    // body — the `SmolStr::new` below copies the bytes
+    // immediately.
+    let raw = unsafe { sys::whisper_lang_str_full(lang_id) };
+    if raw.is_null() {
+      return None;
+    }
+    // SAFETY: NUL-terminated; valid for the duration of this
+    // function call (the `g_lang` storage outlives any
+    // running Rust code on the same thread). `to_bytes`
+    // does not copy; we copy on the next line via
+    // `SmolStr::new`, after which the C-side pointer is no
+    // longer referenced.
+    let bytes = unsafe { core::ffi::CStr::from_ptr(raw).to_bytes() };
+    core::str::from_utf8(bytes).ok().map(SmolStr::new)
+  }
+}
+
+/// Largest language id whisper.cpp recognises, equal to
+/// `whisper_lang_max_id()`.
+///
+/// Useful when sizing the language-probability buffer for a
+/// hypothetical future `whisper_lang_auto_detect` binding —
+/// upstream's contract is "the array must be
+/// `whisper_lang_max_id() + 1` in size".
+pub fn lang_max_id() -> i32 {
+  // SAFETY: pure C function reading a static const table size.
+  unsafe { sys::whisper_lang_max_id() }
+}
+
+/// Look up the integer language id whisper.cpp uses internally
+/// for a given short ISO-639-1 code (`"en"`) or English name
+/// (`"english"`).
+///
+/// Returns `None` when:
+/// * the input contains an interior NUL byte (rejected at the
+///   `CString` conversion);
+/// * whisper.cpp returns -1 ("unknown language");
+/// * the shim caught a C++ exception. Upstream
+///   `whisper_lang_id` does `g_lang.count(const char *)` /
+///   `.at(const char *)` which constructs a temporary
+///   `std::string` from the C string — both can throw
+///   `std::bad_alloc` under memory pressure. The
+///   `whispercpp_lang_id` shim catches and surfaces as a
+///   `WHISPERCPP_ERR_*` sentinel; we collapse those to
+///   `None` so the safe API never observes a thrown
+///   exception across `extern "C"` (which would be UB).
+///
+/// Inverse of [`State::detected_lang`](crate::State::detected_lang)
+/// at the integer-id level. Most callers should prefer the
+/// typed [`Lang`] enum — this raw id is mainly useful for
+/// building `whisper_token_lang(ctx, lang_id)` arguments
+/// (see [`crate::Context::token_for_lang`]).
+pub fn lang_id_for(name: &str) -> Option<i32> {
+  // Defensive cap on input length. Whisper language entries
+  // are short codes (`"en"` = 2 bytes) or English names
+  // (longest is ~13 bytes for `"luxembourgish"`-class
+  // entries); 32 bytes is a comfortable cap that keeps
+  // `lang_id_for(&"x".repeat(N))`-style adversarial inputs
+  // from reaching the upstream
+  // `WHISPER_LOG_ERROR("unknown language '%s'", lang)` path.
+  // That logger formats into a 1024-byte buffer and then
+  // re-formats with the same `va_list` for long messages —
+  // the `whispercpp-sys: log_internal va_copy` patch closes
+  // the va-list-reuse UB structurally, but rejecting
+  // obviously-not-a-language inputs at the safe-Rust
+  // boundary is cheaper and avoids exercising the patched
+  // path at all.
+  let bytes = name.as_bytes();
+  if bytes.len() > 32 {
+    return None;
+  }
+  if bytes.contains(&0) {
+    return None;
+  }
+  // Stack-only NUL-terminated buffer. Avoids the heap
+  // allocation `CString::new(name)` would do per call.
+  // 33 = 32 (cap) + 1 (NUL); zero-initialised so we don't
+  // need an explicit terminator write.
+  let mut buf = [0u8; 33];
+  buf[..bytes.len()].copy_from_slice(bytes);
+  let cstr_ptr: *const core::ffi::c_char = buf.as_ptr().cast();
+  // SAFETY: buf is on the stack and outlives this call.
+  // NUL-terminated by construction (zero-init array). The
+  // shim wraps `whisper_lang_id` in try/catch so a
+  // `std::bad_alloc` from the implicit `std::string(const
+  // char *)` construction inside `g_lang.count()` cannot
+  // unwind into Rust. Caught exceptions surface as
+  // `WHISPERCPP_ERR_*` sentinels at -100..=-103, distinct
+  // from the upstream "not found" sentinel of -1 — we
+  // collapse both negative regions to `None`.
+  let id = unsafe { sys::whispercpp_lang_id(cstr_ptr) };
+  if id < 0 { None } else { Some(id) }
 }
 
 impl core::fmt::Display for Lang {
@@ -825,5 +951,114 @@ mod tests {
       res.is_err(),
       "legacy Other-as-map encoding must be rejected"
     );
+  }
+
+  /// `lang_max_id()` is the size of whisper.cpp's static
+  /// `g_lang` table minus 1. The current bundled whisper
+  /// supports 99 languages (ids 0..=98), so the max id is 98.
+  /// Pin so an upstream rebuild that adds languages doesn't
+  /// silently change buffer-sizing assumptions in callers.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: calls whisper_lang_max_id")]
+  fn lang_max_id_matches_known_table_size() {
+    let max_id = lang_max_id();
+    assert!(
+      max_id >= 98,
+      "lang_max_id should cover at least the v1.8.4 table (98); got {max_id}"
+    );
+    // Sanity upper bound: there are <200 ISO 639-1 codes total;
+    // a value drastically above that means the table was
+    // corrupted or our binding is off.
+    assert!(max_id < 200, "lang_max_id={max_id} is implausibly large");
+  }
+
+  /// `lang_id_for` round-trips with `Lang::as_str()` for every
+  /// named variant (the FFI's `whisper_lang_id` accepts both
+  /// short codes and English names; we feed it short codes).
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: calls whispercpp_lang_id")]
+  fn lang_id_for_round_trips_named_variants() {
+    for lang in [Lang::En, Lang::Zh, Lang::Ja, Lang::Ko, Lang::Yue] {
+      let id = lang_id_for(lang.as_str())
+        .unwrap_or_else(|| panic!("lang_id_for({}) returned None", lang.as_str()));
+      assert!(
+        id >= 0,
+        "lang_id_for({}) returned negative {id}",
+        lang.as_str()
+      );
+      assert!(
+        id <= lang_max_id(),
+        "lang_id_for({}) = {id} exceeds lang_max_id = {}",
+        lang.as_str(),
+        lang_max_id()
+      );
+    }
+  }
+
+  /// `lang_id_for` returns `None` for codes whisper.cpp
+  /// doesn't recognise (covers `Lang::Other(...)` ISO codes
+  /// like `"xx"` that aren't in the upstream table).
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: calls whispercpp_lang_id")]
+  fn lang_id_for_returns_none_on_unknown() {
+    assert_eq!(lang_id_for("xx"), None);
+    assert_eq!(lang_id_for("definitely-not-a-language"), None);
+  }
+
+  /// `lang_id_for` rejects strings with interior NUL bytes at
+  /// the `CString` conversion (would otherwise pass to whisper
+  /// as a truncated lookup; explicit `None` is clearer).
+  #[test]
+  fn lang_id_for_rejects_interior_nul() {
+    assert_eq!(lang_id_for("en\0extra"), None);
+  }
+
+  /// Adversarially-long inputs to `lang_id_for` are rejected
+  /// at the safe-Rust boundary BEFORE reaching the upstream
+  /// `WHISPER_LOG_ERROR("unknown language '%s'", ...)` log
+  /// path. The companion `whispercpp-sys: log_internal
+  /// va_copy` patch closes the va-list-reuse UB structurally,
+  /// but rejecting obviously-not-a-language inputs at the
+  /// boundary is cheaper. The cap (32 bytes) gives generous
+  /// headroom over the longest known whisper language name
+  /// (`"luxembourgish"`-class entries, ~13 bytes).
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: just-under-cap branch reaches whispercpp_lang_id")]
+  fn lang_id_for_rejects_overlong_input() {
+    let long = "x".repeat(2000);
+    assert_eq!(lang_id_for(&long), None);
+    // One byte over the cap is rejected at the safe-Rust boundary
+    // (the cap is `> 32`, so `len() == 33` fails the check).
+    let one_over_cap = "x".repeat(33);
+    assert_eq!(lang_id_for(&one_over_cap), None);
+    // Exactly at the cap (`len() == 32`) passes the boundary check
+    // and reaches FFI; whisper.cpp returns "unknown" for
+    // non-language strings, which we surface as None.
+    let at_cap = "x".repeat(32);
+    assert_eq!(lang_id_for(&at_cap), None);
+  }
+
+  /// `Lang::full_name()` returns the English name for known
+  /// languages — `"english"` for `Lang::En`, `"chinese"` for
+  /// `Lang::Zh`, etc. Owned `SmolStr` (not `&'static str`)
+  /// so the result doesn't outlive the C++ static
+  /// `g_lang.std::string` storage; see the function's
+  /// doc-comment for the soundness rationale.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: calls whisper_lang_str_full")]
+  fn full_name_returns_english_name_for_known_langs() {
+    assert_eq!(Lang::En.full_name(), Some(SmolStr::new("english")));
+    assert_eq!(Lang::Zh.full_name(), Some(SmolStr::new("chinese")));
+    assert_eq!(Lang::Ja.full_name(), Some(SmolStr::new("japanese")));
+    assert_eq!(Lang::Fr.full_name(), Some(SmolStr::new("french")));
+  }
+
+  /// `Lang::full_name()` returns `None` for `Lang::Other(...)`
+  /// codes whisper.cpp doesn't recognise.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: lang_id_for(\"xx\") reaches whispercpp_lang_id")]
+  fn full_name_returns_none_for_unknown_other() {
+    let unknown = Lang::Other(SmolStr::new("xx"));
+    assert_eq!(unknown.full_name(), None);
   }
 }

@@ -388,9 +388,80 @@ impl Params {
   /// Stores the `CString` for the lifetime of `self` — fixing the
   /// `whisper-rs` leak.
   ///
-  /// Returns [`WhisperError::InvalidCString`] if `lang` contains
-  /// an interior NUL byte. **Panic-free.**
+  /// Returns:
+  ///
+  /// * [`WhisperError::InputTooLong`] if `lang` exceeds 32 bytes
+  ///   (the same defensive bound as
+  ///   [`crate::lang_id_for`](crate::lang_id_for) — see that
+  ///   function for the rationale).
+  /// * [`WhisperError::InvalidCString`] if `lang` contains an
+  ///   interior NUL byte. Checked before the language-table
+  ///   lookup so an input like `"en\0extra"` classifies as a
+  ///   NUL error, not as "unknown language".
+  /// * [`WhisperError::UnknownLanguage`] if `lang` is
+  ///   non-empty and not `"auto"` and whisper.cpp's
+  ///   `whisper_lang_id` lookup doesn't recognise it.
+  ///
+  /// The empty string `""` and `"auto"` pass through
+  /// unchecked as auto-detect sentinels (whisper.cpp
+  /// triggers language detection when the field is one of
+  /// these). Any other value is validated against the
+  /// upstream language table BEFORE being stored, so a
+  /// config typo (`"english"` → ok, `"engish"` → error)
+  /// surfaces immediately rather than silently corrupting
+  /// the decoder prompt with `whisper_token_lang(ctx, -1)`
+  /// later in `State::full`.
+  ///
+  /// **Panic-free.**
   pub fn set_language(&mut self, lang: &str) -> WhisperResult<&mut Self> {
+    const LANG_CAP: usize = 32;
+    if lang.len() > LANG_CAP {
+      // Trim the diagnostic to a bounded UTF-8 prefix
+      // before stuffing it into the error payload. Without
+      // the trim, a 100-KiB attacker-controlled `lang`
+      // value would heap-allocate a 100-KiB SmolStr (the
+      // inline cap is 23 bytes) and propagate through to
+      // log tails on `Display` — turning a bad config
+      // into log amplification or avoidable OOM, defeating
+      // the cap that just rejected the input. 64 chars
+      // matches `set_initial_prompt`'s existing pattern;
+      // the resulting diagnostic is at most ~256 bytes
+      // (UTF-8 chars are ≤ 4 bytes).
+      let head: String = lang.chars().take(64).collect();
+      return Err(WhisperError::InputTooLong {
+        head: smol_str::SmolStr::new(head),
+        len: lang.len(),
+        cap: LANG_CAP,
+      });
+    }
+    // Pre-scan for interior NUL BEFORE the language-table
+    // lookup. `lang_id_for` rejects NUL by returning `None`
+    // (its CString-equivalent path), which without this
+    // check would route an `"en\0extra"`-shaped input to
+    // `WhisperError::UnknownLanguage` — misclassifying a
+    // NUL-byte error as "unknown language". Surface it as
+    // `InvalidCString` here so the diagnostic matches the
+    // actual failure mode.
+    if lang.as_bytes().contains(&0) {
+      return Err(WhisperError::InvalidCString(smol_str::SmolStr::new(lang)));
+    }
+    // Validate against whisper.cpp's language table BEFORE
+    // storing the C string. Without this, `params.language
+    // = "xx"` flows through to `whisper_full_with_state`,
+    // where `whisper_lang_id(params.language)` returns -1
+    // and `whisper_token_lang(ctx, -1)` pushes a garbage
+    // token into the decoder prompt — producing wrong
+    // transcripts with no error signal to safe Rust.
+    //
+    // Allow "" and "auto" (whisper.cpp's auto-detect
+    // sentinels) without consulting the table: those are
+    // legitimate config values that intentionally bypass
+    // the static lookup.
+    if !lang.is_empty() && lang != "auto" && crate::lang_id_for(lang).is_none() {
+      // `lang.len() <= 32` here (length check above), so
+      // this clone is bounded.
+      return Err(WhisperError::UnknownLanguage(smol_str::SmolStr::new(lang)));
+    }
     let cstr =
       CString::new(lang).map_err(|_| WhisperError::InvalidCString(smol_str::SmolStr::new(lang)))?;
     self.raw.language = cstr.as_ptr();
@@ -401,17 +472,69 @@ impl Params {
   /// Set the initial prompt (`<|prompt|>` text, decoded by the
   /// model before generation). Owns the `CString`.
   ///
-  /// Returns [`WhisperError::InvalidCString`] on interior NUL.
-  /// **Panic-free.**
+  /// Returns:
+  ///
+  /// * [`WhisperError::InputTooLong`] if `prompt` exceeds 1 MiB
+  ///   (defense in depth — see the cap rationale on the
+  ///   implementation).
+  /// * [`WhisperError::InvalidCString`] on interior NUL.
+  /// * [`WhisperError::AllocationFailed`] when the input cannot
+  ///   be copied (the buffer allocation reports
+  ///   `try_reserve_exact` failure under memory pressure).
+  ///
+  /// **Panic-free** — uses `Vec::try_reserve_exact` for the
+  /// copy so attacker-sized prompts can't abort the process
+  /// from safe Rust.
   pub fn set_initial_prompt(&mut self, prompt: &str) -> WhisperResult<&mut Self> {
-    let cstr = CString::new(prompt).map_err(|_| {
-      // The prompt may be very long; trim the diagnostic so the
-      // error doesn't drag a kilobyte of audio context into log
-      // tails. SmolStr inlines short captures (≤23 bytes); a 64-
-      // char head usually allocates but stays bounded.
+    // Length cap (defense in depth). Whisper's text context
+    // is bounded at `n_text_ctx` (≤ 448 tokens for stock
+    // checkpoints); a prompt larger than 1 MiB cannot fit
+    // even at worst-case 1-byte-per-token tokenisation, and
+    // sending it to FFI would walk the upstream
+    // `whisper_tokenize` path that the `whisper_tokenize
+    // size_t→int overflow guard` patch protects. Reject up
+    // front so a misuse / attacker-controlled long prompt
+    // can't drive the FFI tokenisation at all. 1 MiB leaves
+    // ~6 orders of magnitude of headroom over realistic
+    // prompts.
+    const MAX_INITIAL_PROMPT_BYTES: usize = 1 << 20;
+    if prompt.len() > MAX_INITIAL_PROMPT_BYTES {
       let head: String = prompt.chars().take(64).collect();
-      WhisperError::InvalidCString(smol_str::SmolStr::new(head))
-    })?;
+      return Err(WhisperError::InputTooLong {
+        head: smol_str::SmolStr::new(head),
+        len: prompt.len(),
+        cap: MAX_INITIAL_PROMPT_BYTES,
+      });
+    }
+    // Pre-scan for interior NUL before any allocation. If the
+    // input is invalid, we trim the diagnostic to a 64-char
+    // head — the prompt may be a kilobyte of audio context;
+    // dragging the whole thing into a log tail is the same
+    // amplification class `set_language`'s overlong-rejection
+    // already guards against.
+    if prompt.as_bytes().contains(&0) {
+      let head: String = prompt.chars().take(64).collect();
+      return Err(WhisperError::InvalidCString(smol_str::SmolStr::new(head)));
+    }
+    // Fallible NUL-terminated copy. The infallible
+    // `CString::new(prompt)` would route through the global
+    // allocator's abort-on-OOM contract — a 100 MiB prompt
+    // under memory pressure could kill the process from a
+    // safe public setter. `try_reserve_exact(len + 1)` makes
+    // the failure a typed error.
+    let bytes = prompt.as_bytes();
+    let mut buf: Vec<u8> = Vec::new();
+    buf
+      .try_reserve_exact(bytes.len() + 1)
+      .map_err(|_| WhisperError::AllocationFailed {
+        context: "Params::set_initial_prompt copy buffer",
+      })?;
+    buf.extend_from_slice(bytes);
+    buf.push(0);
+    // SAFETY: `buf` ends in exactly one NUL (just pushed) and
+    // contains no other NULs (pre-scan above). Pre-conditions
+    // for `CString::from_vec_with_nul_unchecked` are met.
+    let cstr = unsafe { CString::from_vec_with_nul_unchecked(buf) };
     self.raw.initial_prompt = cstr.as_ptr();
     self._initial_prompt = Some(cstr);
     Ok(self)
@@ -701,6 +824,17 @@ impl Params {
 
   /// Hard cap on audio duration to decode, in milliseconds.
   /// `0` means "to end of input". Defaults to `0`.
+  ///
+  /// Whisper.cpp does not bound the resulting `seek_end`
+  /// to the available mel length — out-of-range values
+  /// drive a long zero-padded decode loop instead of
+  /// erroring (`src/whisper.cpp:7442`). The wrapper
+  /// validates `offset_ms + duration_ms <= audio_len_ms`
+  /// at [`State::full`](crate::State::full) entry and
+  /// returns
+  /// [`WhisperError::InvalidDuration`](crate::WhisperError::InvalidDuration)
+  /// rather than letting the slip turn into a
+  /// hung-worker DoS.
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub const fn set_duration_ms(&mut self, ms: i32) -> &mut Self {
     self.raw.duration_ms = ms;
@@ -861,28 +995,41 @@ impl Params {
   /// `tokens_prev`). The slice is COPIED into a `Vec` owned by
   /// `self`; the caller's slice may be dropped after this call
   /// returns. Pass `&[]` to clear a previously-set prompt.
-  pub fn set_tokens(&mut self, tokens: &[i32]) -> &mut Self {
+  ///
+  /// Returns [`WhisperError::AllocationFailed`] if the copy
+  /// buffer cannot be reserved (`Vec::try_reserve_exact`
+  /// failure). **Panic-free** — `slice::to_vec` would route
+  /// through the abort-on-OOM global allocator; the fallible
+  /// reserve makes a multi-gigabyte token vector under memory
+  /// pressure a typed error instead of a process abort.
+  pub fn set_tokens(&mut self, tokens: &[i32]) -> WhisperResult<&mut Self> {
     if tokens.is_empty() {
       self.raw.prompt_tokens = core::ptr::null();
       self.raw.prompt_n_tokens = 0;
       self._prompt_tokens = None;
-    } else {
-      // Bound the slice copy at `i32::MAX` elements so the
-      // assignment to `prompt_n_tokens` (a C `int`) cannot
-      // wrap to a negative or truncated count. `prompt_n_tokens`
-      // crosses the FFI as `int`, and `tokens.len() as i32`
-      // would silently truncate / wrap on slices wider than
-      // 2 GiB of `whisper_token` (impossible in practice on
-      // any current platform, but the cast is unsound under
-      // the crate's panic-free contract).
-      let max_len = i32::MAX as usize;
-      let take = tokens.len().min(max_len);
-      let owned: Vec<sys::whisper_token> = tokens[..take].to_vec();
-      self.raw.prompt_tokens = owned.as_ptr();
-      self.raw.prompt_n_tokens = owned.len() as i32;
-      self._prompt_tokens = Some(owned);
+      return Ok(self);
     }
-    self
+    // Bound the slice copy at `i32::MAX` elements so the
+    // assignment to `prompt_n_tokens` (a C `int`) cannot
+    // wrap to a negative or truncated count. `prompt_n_tokens`
+    // crosses the FFI as `int`, and `tokens.len() as i32`
+    // would silently truncate / wrap on slices wider than
+    // 2 GiB of `whisper_token` (impossible in practice on
+    // any current platform, but the cast is unsound under
+    // the crate's panic-free contract).
+    let max_len = i32::MAX as usize;
+    let take = tokens.len().min(max_len);
+    let mut owned: Vec<sys::whisper_token> = Vec::new();
+    owned
+      .try_reserve_exact(take)
+      .map_err(|_| WhisperError::AllocationFailed {
+        context: "Params::set_tokens prompt buffer",
+      })?;
+    owned.extend_from_slice(&tokens[..take]);
+    self.raw.prompt_tokens = owned.as_ptr();
+    self.raw.prompt_n_tokens = owned.len() as i32;
+    self._prompt_tokens = Some(owned);
+    Ok(self)
   }
 
   /// Internal: hand the raw C struct to `state::full`.
@@ -899,6 +1046,90 @@ impl Params {
   #[cfg_attr(not(tarpaulin), inline(always))]
   pub(crate) fn prompt_tokens(&self) -> Option<&[i32]> {
     self._prompt_tokens.as_deref()
+  }
+
+  /// Internal: borrow the language hint as a Rust `&str`
+  /// (UTF-8 decoded from the stored `CString`). Used by
+  /// `State::full` for the model-bound language preflight.
+  ///
+  /// When `set_language` has been called, this returns the
+  /// owned mirror. Otherwise it falls back to
+  /// `raw.language` — the pointer
+  /// `whisper_full_default_params` initialises to the
+  /// `"en"` string literal at upstream
+  /// `whisper.cpp:6621`. Without the fallback, a fresh
+  /// `Params::new(...)` would report `None`, which the
+  /// `State::full` preflight interprets as auto-detect —
+  /// rejecting English-only checkpoints on the default
+  /// happy path even though upstream would happily run
+  /// inference with `language = "en"`.
+  ///
+  /// Returns `None` only when the C pointer is somehow
+  /// NULL (defensive — the `_language: None` constructor
+  /// path always leaves `raw.language` pointing at the
+  /// `"en"` literal, and `set_language` always writes both
+  /// halves) or when the stored bytes aren't valid UTF-8
+  /// (shouldn't happen — `set_language` took a `&str`, and
+  /// upstream's literals are ASCII).
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn language(&self) -> Option<&str> {
+    if let Some(cstr) = self._language.as_ref() {
+      return cstr.to_str().ok();
+    }
+    if self.raw.language.is_null() {
+      return None;
+    }
+    // SAFETY: `raw.language` is non-null. When `_language`
+    // is None we are on the `Params::new` default path, so
+    // the pointer is upstream's `"en"` string literal
+    // (`'static`). When `_language` is `Some`, we returned
+    // above; so the only way to reach this CStr deref with
+    // a non-static pointer would be a private-field bypass
+    // (impossible from outside the crate). The returned
+    // `&str` is bounded by `&self`, which keeps `Params`
+    // alive — and with it any CString `set_language` might
+    // have stored (whose heap buffer the pointer would
+    // alias, were the ordering ever inverted in the
+    // future).
+    unsafe { core::ffi::CStr::from_ptr(self.raw.language) }
+      .to_str()
+      .ok()
+  }
+
+  /// Internal: read the `detect_language` flag. Used by
+  /// `State::full`'s language preflight to decide whether
+  /// an explicit `params.language` hint is authoritative
+  /// or just a fallback that auto-detect overrides.
+  ///
+  /// Per upstream semantics
+  /// ([`Self::set_detect_language`]), `detect_language =
+  /// true` makes whisper.cpp run language detection on the
+  /// audio and use the result, ignoring any explicit
+  /// `params.language` hint. The preflight skips its
+  /// model-bound check in that case.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn detect_language(&self) -> bool {
+    self.raw.detect_language
+  }
+
+  /// Internal: read `offset_ms` for the State::full
+  /// duration-range preflight. Stored as i32 in
+  /// `whisper_full_params`; clamped to ≥ 0 by
+  /// [`Self::set_offset_ms`] before reaching here.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn offset_ms(&self) -> i32 {
+    self.raw.offset_ms
+  }
+
+  /// Internal: read `duration_ms` for the State::full
+  /// duration-range preflight. Stored as i32 in
+  /// `whisper_full_params`. `0` is the upstream sentinel
+  /// for "process to end of input"; non-zero values are
+  /// validated against the actual sample-buffer length in
+  /// `State::full`.
+  #[cfg_attr(not(tarpaulin), inline(always))]
+  pub(crate) fn duration_ms(&self) -> i32 {
+    self.raw.duration_ms
   }
 }
 
@@ -1092,5 +1323,235 @@ mod tests {
     assert_eq!(g.raw.greedy.best_of, MAX_BEAM_SIZE + 1);
     unsafe { g.set_best_of_unchecked(0) };
     assert_eq!(g.raw.greedy.best_of, 1);
+  }
+
+  /// `set_language` rejects inputs longer than 32 bytes —
+  /// matches the cap on `lang_id_for`. The 32-byte length
+  /// check fires BEFORE the language-table validation, so
+  /// any input over the cap reports as `InvalidCString`
+  /// (length-class) rather than `UnknownLanguage`.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn set_language_rejects_overlong_input() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    let long = "x".repeat(2000);
+    assert!(
+      p.set_language(&long).is_err(),
+      "2000-byte input must be rejected"
+    );
+    let over_cap = "x".repeat(33);
+    assert!(
+      p.set_language(&over_cap).is_err(),
+      "33-byte input (cap+1) must be rejected by the length check"
+    );
+  }
+
+  /// `set_language` still rejects interior-NUL inputs
+  /// (CString::new behaviour). With the new validation
+  /// pre-check, the NUL rejection actually surfaces
+  /// earlier — the language-table lookup runs before the
+  /// CString conversion, and `lang_id_for` itself rejects
+  /// interior-NUL inputs at its own CString step. Either
+  /// way the result is `Err`.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn set_language_rejects_interior_nul() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    assert!(p.set_language("en\0extra").is_err());
+  }
+
+  /// `set_language` validates against whisper.cpp's
+  /// language table. Unknown codes return
+  /// `WhisperError::UnknownLanguage` rather than silently
+  /// flowing through to `whisper_full_with_state`, where
+  /// the unknown lookup would push
+  /// `whisper_token_lang(ctx, -1)` into the decoder
+  /// prompt and produce wrong transcripts with no error
+  /// signal.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn set_language_rejects_unknown_code() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    match p.set_language("xx") {
+      Err(crate::WhisperError::UnknownLanguage(s)) => {
+        assert_eq!(s.as_str(), "xx");
+      }
+      other => panic!("expected UnknownLanguage, got {other:?}"),
+    }
+    // Mid-cap unknown is still rejected as UnknownLanguage
+    // (length check passes, then table lookup fails).
+    let unknown_at_cap = "x".repeat(32);
+    match p.set_language(&unknown_at_cap) {
+      Err(crate::WhisperError::UnknownLanguage(_)) => {}
+      other => panic!("expected UnknownLanguage for 32-byte unknown, got {other:?}"),
+    }
+  }
+
+  /// `""` and `"auto"` are auto-detect sentinels that
+  /// whisper.cpp handles specially — accepted by
+  /// `set_language` even though they wouldn't pass the
+  /// `lang_id_for` lookup.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn set_language_accepts_auto_detect_sentinels() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    assert!(p.set_language("").is_ok(), "empty string must pass through");
+    assert!(p.set_language("auto").is_ok(), "\"auto\" must pass through");
+  }
+
+  /// Known short codes pass: `"en"`, `"zh"`, `"ja"`.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn set_language_accepts_known_codes() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    assert!(p.set_language("en").is_ok());
+    assert!(p.set_language("zh").is_ok());
+    assert!(p.set_language("ja").is_ok());
+    // English names also work (whisper.cpp's `whisper_lang_id`
+    // accepts both).
+    assert!(p.set_language("english").is_ok());
+  }
+
+  /// Pathologically-long inputs must NOT have their full
+  /// content retained in the error payload. Without the
+  /// 64-char-head trim on the length-check rejection path,
+  /// a 100-KiB attacker `lang` would heap-allocate a
+  /// 100-KiB `SmolStr` and propagate through `Display` to
+  /// log tails — turning a bad config into log
+  /// amplification / avoidable OOM, defeating the very cap
+  /// that rejected the input. This test pins the bounded-
+  /// diagnostic property: the error's `Display` length is
+  /// proportional to the trim, not to the input.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn set_language_overlong_error_does_not_retain_full_payload() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    let huge = "x".repeat(100_000);
+    let err = p
+      .set_language(&huge)
+      .expect_err("100 KiB language input must be rejected");
+    let displayed = format!("{err}");
+    // The error message should NOT contain anything close
+    // to the full 100 KiB input. The trim is 64 chars;
+    // even with format-string overhead, 1 KiB is a
+    // generous bound.
+    assert!(
+      displayed.len() < 1024,
+      "error display retained {} bytes of attacker input — \
+       overlong-rejection path must trim before storing",
+      displayed.len()
+    );
+    // And the error variant carries a SmolStr we can
+    // inspect directly. Bound at 256 bytes (64 chars × 4
+    // bytes-per-UTF-8-char worst case). Length rejections
+    // surface as `InputTooLong` (distinct from
+    // `InvalidCString`, which is reserved for interior NUL).
+    if let WhisperError::InputTooLong { head, len, cap } = err {
+      assert!(
+        head.len() <= 256,
+        "InputTooLong head retained {} bytes; cap is 256",
+        head.len()
+      );
+      assert_eq!(
+        len, 100_000,
+        "InputTooLong should report the raw input length"
+      );
+      assert_eq!(cap, 32, "set_language's cap is 32 bytes");
+    } else {
+      panic!("expected InputTooLong from length-rejection path; got {err:?}");
+    }
+  }
+
+  /// `set_language` with an interior NUL byte must classify
+  /// as `InvalidCString`, NOT `UnknownLanguage`. The
+  /// language-table lookup (`crate::lang_id_for`) rejects
+  /// NULs by returning `None`, which without the explicit
+  /// pre-scan would route here as "unknown language" — a
+  /// misleading classification of what is actually a
+  /// NUL-byte error.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn set_language_interior_nul_classifies_as_invalid_cstring() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    let err = p
+      .set_language("en\0extra")
+      .expect_err("interior NUL must be rejected");
+    assert!(
+      matches!(err, WhisperError::InvalidCString(_)),
+      "expected InvalidCString for interior NUL, got {err:?}"
+    );
+  }
+
+  /// `set_offset_ms` clamps negative inputs to `0` per the
+  /// safety note on the setter (negative offset turns into
+  /// an out-of-bounds mel read in
+  /// `whisper_full_with_state`). The `pub(crate)` accessor
+  /// must observe the clamped value, since `State::full`'s
+  /// duration preflight relies on it.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn offset_ms_accessor_observes_setter_clamp() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    p.set_offset_ms(-500);
+    assert_eq!(p.offset_ms(), 0);
+    p.set_offset_ms(2_500);
+    assert_eq!(p.offset_ms(), 2_500);
+  }
+
+  /// `Params::new(...)` calls
+  /// `whisper_full_default_params`, which sets
+  /// `raw.language = "en"` (string literal at upstream
+  /// `whisper.cpp:6621`). The Rust-side mirror
+  /// (`_language`) is `None` at construction. Pin that
+  /// `language()` falls back to the raw pointer — without
+  /// the fallback, fresh defaults would report `None`,
+  /// `State::full`'s preflight would interpret that as
+  /// auto-detect, and English-only checkpoints would
+  /// reject on the default happy path.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn default_params_language_falls_back_to_upstream_en() {
+    let p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    assert_eq!(
+      p.language(),
+      Some("en"),
+      "fresh Params::new(...) must report `en` to match upstream's \
+       whisper_full_default_params default — preflight relies on this"
+    );
+  }
+
+  /// After `set_language("auto")`, the mirror takes
+  /// precedence over the raw default. Pin so a future
+  /// "always read raw.language" refactor can't bypass the
+  /// user's explicit hint.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn set_language_overrides_default_fallback() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    p.set_language("auto").expect("auto is a valid hint");
+    assert_eq!(p.language(), Some("auto"));
+    p.set_language("zh").expect("zh is a known code");
+    assert_eq!(p.language(), Some("zh"));
+  }
+
+  /// `set_duration_ms` does NOT clamp — the setter is a
+  /// `const fn` straight assignment, and `State::full`'s
+  /// preflight is the gate that catches out-of-range
+  /// values. Pin both halves: setter passes the value
+  /// through unchanged, accessor reflects it.
+  #[test]
+  #[cfg_attr(miri, ignore = "FFI: whisper_full_default_params")]
+  fn duration_ms_accessor_round_trips_setter() {
+    let mut p = Params::new(SamplingStrategy::Greedy { best_of: 1 });
+    p.set_duration_ms(0);
+    assert_eq!(p.duration_ms(), 0, "0 = 'to end of input' sentinel");
+    p.set_duration_ms(1_500);
+    assert_eq!(p.duration_ms(), 1_500);
+    // Negative passes through the setter; State::full's
+    // preflight rejects it as InvalidDuration. Pin so a
+    // future "clamp here too" change is intentional, not
+    // accidental.
+    p.set_duration_ms(-1);
+    assert_eq!(p.duration_ms(), -1);
   }
 }

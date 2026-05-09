@@ -20,6 +20,8 @@ use std::{
   sync::{Arc, Mutex, MutexGuard},
 };
 
+use smol_str::SmolStr;
+
 use crate::{
   error::{WhisperError, WhisperResult},
   state::State,
@@ -655,11 +657,12 @@ impl Context {
     if dtw_on && params.flash_attn() {
       return Err(WhisperError::ContextLoad {
         path: smol_str::SmolStr::new(path_str.as_ref()),
-        reason: smol_str::SmolStr::new(
+        reason: SmolStr::new_static(
           "DTW token timestamps cannot be combined with flash_attn — \
            whisper.cpp silently disables DTW under flash_attn. \
            Set with_flash_attn(false) or with_dtw_token_timestamps(false).",
         ),
+        code: None,
       });
     }
 
@@ -730,26 +733,40 @@ impl Context {
     // then performs throwing model-load work (vector
     // allocations for tensors, GPU buffer allocations on
     // Apple Silicon / CUDA, file-stream reads). If a
-    // `std::bad_alloc` or `std::system_error` fires AFTER
-    // the raw `new` succeeded but BEFORE the function's own
-    // explicit-cleanup branches run, the partial
-    // `whisper_context` and any tensor/backend buffers
-    // already allocated leak — the shim catches the
-    // exception but has no pointer to clean up.
+    // `std::bad_alloc` or `std::system_error` fires after
+    // the raw `new whisper_context` succeeded, the
+    // submodule's `init_context RAII exit` patch
+    // (`try { ... } catch { whisper_free(ctx); throw; }`)
+    // reclaims everything reachable through `ctx` —
+    // `model.ctxs`, `model.buffers`, `state`.
     //
-    // The shim keeps a thread-local sentinel that
-    // distinguishes the two flavours of NULL return:
+    // The model-load path closes its previously-leaky
+    // windows around raw ggml_context / backend buffer
+    // pointers via the patches `model_load RAII for raw
+    // ggml allocations`, `model_load tensor-prep RAII`,
+    // and `model_load buffer-registration RAII`. Each raw
+    // pointer that survives a throwing registration sits
+    // under a `ggml_context_ptr` / `ggml_backend_buffer_ptr`
+    // guard; on throw the guard frees, on success the
+    // ownership is committed to `model.ctxs` /
+    // `model.buffers` BEFORE the guard releases. Both
+    // structures are walked by `whisper_free`.
     //
-    // * `take_last_constructor_exception == 0` →
-    //   upstream returned NULL CLEANLY (file-not-found,
-    //   wrong magic, backend refused — no `new` happened
-    //   yet, or upstream's own bool-failure paths cleaned
-    //   up). Surface as `ContextLoad`, retryable.
-    // * `take_last_constructor_exception != 0` → the
-    //   shim caught a C++ throw with the `new
-    //   whisper_context` already allocated. Surface as
-    //   `ConstructorLost`, NOT retryable — see that
-    //   variant's docs for the recovery contract.
+    // The shim's thread-local sentinel distinguishes the
+    // two flavours of NULL return — used here for
+    // diagnostic value, not recovery classification:
+    //
+    // * `take_last_constructor_exception == 0` → upstream
+    //   returned NULL via its own bool-failure path
+    //   (file-not-found, wrong magic, backend refused).
+    // * `take_last_constructor_exception != 0` → the shim
+    //   caught a C++ throw; the RAII catch + per-pointer
+    //   guards reclaimed every native allocation made on
+    //   the failing path.
+    //
+    // Both surface as `ContextLoad` (retryable, no leak).
+    // The sentinel value, when present, is embedded in
+    // the error's `reason` field for log triage.
     let raw = unsafe { sys::whispercpp_init_from_file_no_state(cpath.as_ptr(), cparams) };
 
     if let Some(ptr) = NonNull::new(raw) {
@@ -781,10 +798,11 @@ impl Context {
           unsafe { sys::whisper_free(ptr.as_ptr()) };
           return Err(WhisperError::ContextLoad {
             path: smol_str::SmolStr::new(path_str.as_ref()),
-            reason: smol_str::SmolStr::new(
+            reason: SmolStr::new_static(
               "DTW enabled with a model whose n_text_ctx exceeds SUPPORTED_DTW_N_TEXT_CTX (448) — \
                disable DTW (with_dtw_token_timestamps(false)) or use a standard checkpoint",
             ),
+            code: None,
           });
         }
       }
@@ -798,17 +816,39 @@ impl Context {
     // thread that made the constructor call, with no other
     // shim entry between them.
     let exc = unsafe { sys::whispercpp_take_last_constructor_exception() };
-    if exc != 0 {
-      return Err(WhisperError::ConstructorLost {
-        origin: "context",
-        code: exc,
-      });
-    }
+    // Allocation-free reason on the caught-exception path.
+    // The previous design `format!(...)` + `SmolStr::new(...)`
+    // heap-allocated TWICE on the very path most likely
+    // running under memory pressure (a recoverable
+    // `bad_alloc` from upstream); both calls route through
+    // the abort-on-OOM global allocator and could kill the
+    // process while reporting the recoverable failure.
+    // Static reason strings + a separate `code` field
+    // construct the error without any further allocation
+    // beyond the `path` SmolStr (whose allocation is
+    // unavoidable — paths are caller-controlled and the
+    // diagnostic needs to identify the file). Even that
+    // inlines for paths ≤ 23 bytes.
+    let (reason, code) = if exc != 0 {
+      (
+        SmolStr::new_static(
+          "whispercpp_init_from_file_no_state caught C++ exception; \
+           native cleanup completed via init_context RAII exit + model_load RAII guards",
+        ),
+        Some(exc),
+      )
+    } else {
+      (
+        SmolStr::new_static(
+          "whispercpp_init_from_file_no_state returned NULL (upstream load failure, no native exception caught)",
+        ),
+        None,
+      )
+    };
     Err(WhisperError::ContextLoad {
       path: smol_str::SmolStr::new(path_str.as_ref()),
-      reason: smol_str::SmolStr::new(
-        "whispercpp_init_from_file_no_state returned NULL (upstream load failure, no native exception caught)",
-      ),
+      reason,
+      code,
     })
   }
 
@@ -855,18 +895,28 @@ impl Context {
     //
     // # NULL-discrimination contract
     //
-    // Same flavour split as `Context::new`: upstream's
-    // `whisper_init_state` either returns NULL via its
-    // bool-failure paths (every `if (!whisper_kv_cache_init…)`
-    // branch runs `whisper_free_state(state); return nullptr;`
-    // before returning — leak-free) OR throws a C++
-    // exception that our shim catches AFTER `new
-    // whisper_state` already happened (partial leak).
+    // Same flavour split as `Context::new`. Both NULL-return
+    // paths in `whisper_init_state` are leak-free with the
+    // submodule's RAII patches in place:
     //
-    // Read the thread-local sentinel to distinguish:
-    // * `0`     → `StateInit` (retryable, no leak)
-    // * `≠ 0`   → `ConstructorLost { origin: "state", … }`
-    //   (fatal, partial allocation leaked, do not auto-retry)
+    //   * Bool-failure paths each call `whisper_free_state(state);
+    //     return nullptr;` before returning.
+    //   * The outer `init_state RAII exit` patch wraps the
+    //     throwing region in `try { ... } catch {
+    //     whisper_free_state(state); throw; }`, so a caught
+    //     exception leaves no partial state behind.
+    //
+
+    // Read the thread-local sentinel for diagnostic value
+    // only. With the submodule's `init_state RAII exit` patch
+    // both paths leave native memory clean:
+    //   * `0`     → upstream bool-failure path (already freed)
+    //   * `≠ 0`   → caught C++ exception that the RAII
+    //               `try { ... } catch { whisper_free_state(state);
+    //               throw; }` block freed before rethrowing
+    //
+    // Both surface as `StateInit { code: ... }` — retryable,
+    // no Context poison.
     let raw = unsafe { sys::whispercpp_init_state(self.ptr.as_ptr()) };
     // TOCTOU close. Between the entry-time
     // `lost.load` above and `whispercpp_init_state` returning,
@@ -886,37 +936,55 @@ impl Context {
         // SAFETY: `raw` is the just-returned, never-published
         // result of `whispercpp_init_state`; nothing else
         // holds it. `whisper_free_state` is the matching
-        // deallocator.
+        // deallocator. Drain the thread-local sentinel
+        // unconditionally so a stale value from this call
+        // doesn't leak into the next constructor's
+        // catch-block. On the success-then-poisoned path we
+        // expect sentinel == 0; the drain is defensive.
         unsafe { sys::whisper_free_state(state_ptr.as_ptr()) };
+        let _ = unsafe { sys::whispercpp_take_last_constructor_exception() };
+        return Err(WhisperError::ContextPoisoned);
       }
-      // Even if the alloc threw (raw is null), drain the
-      // thread-local sentinel so it doesn't leak across into
-      // the next constructor call's catch-block.
+      // Constructor returned NULL while the Context was
+      // poisoned by a sibling. The sentinel is drained
+      // (defensive) but ContextPoisoned wins: the caller's
+      // recovery contract is "drop the Context", and that
+      // already covers any state-init detail we'd otherwise
+      // report.
+      // SAFETY: pure thread-local read+write; same thread as
+      // the constructor call, no intervening shim entry.
       let _ = unsafe { sys::whispercpp_take_last_constructor_exception() };
       return Err(WhisperError::ContextPoisoned);
     }
     if let Some(state_ptr) = NonNull::new(raw) {
+      // Drain a stray sentinel from a prior, possibly-aborted
+      // call on this thread before publishing the state, so
+      // a future `create_state` doesn't observe stale data.
+      // SAFETY: pure thread-local read+write; same thread.
+      let _ = unsafe { sys::whispercpp_take_last_constructor_exception() };
       return Ok(State::from_raw(state_ptr, Arc::clone(self)));
     }
+    // NULL return on a healthy Context.
+    //
+    // Read the sentinel for diagnostic value: with the
+    // submodule's `init_state RAII exit` patch in place, a
+    // non-zero sentinel means whisper.cpp's outer
+    // `try { ... } catch { whisper_free_state(state); throw; }`
+    // already reclaimed the partial state before the rethrow
+    // — there is nothing left to leak, and the failure is
+    // recoverable. Both paths therefore report `StateInit`;
+    // the sentinel only differentiates them for telemetry.
+    //
+    // The Context is NOT poisoned here. Sibling States and
+    // future `create_state` calls remain valid; an immediate
+    // retry under reduced load may succeed.
+    //
     // SAFETY: pure C call; thread-local read on the same
     // thread, no other shim call between.
     let exc = unsafe { sys::whispercpp_take_last_constructor_exception() };
-    if exc != 0 {
-      // A caught constructor exception means upstream
-      // `whisper_init_state` left partial native allocations
-      // that we cannot reliably free (the throw could have
-      // happened mid-init at any sub-call). Poison the
-      // Context so subsequent
-      // `create_state` calls fail with `ContextPoisoned`
-      // instead of repeating the same OOM / system_error
-      // path and compounding leaks.
-      self.lost.store(true, Ordering::Release);
-      return Err(WhisperError::ConstructorLost {
-        origin: "state",
-        code: exc,
-      });
-    }
-    Err(WhisperError::StateInit)
+    Err(WhisperError::StateInit {
+      code: if exc == 0 { None } else { Some(exc) },
+    })
   }
 
   /// Internal: hand the raw pointer to siblings in this crate
@@ -1079,6 +1147,361 @@ impl Context {
     let bytes = unsafe { core::ffi::CStr::from_ptr(raw).to_bytes() };
     core::str::from_utf8(bytes).ok()
   }
+
+  /// Raw byte view of a token's vocab entry. The same data
+  /// [`Self::token_to_str`] returns, but as `&[u8]` so the
+  /// caller can decide whether non-UTF-8 BPE-merge bytes are
+  /// expected or not.
+  ///
+  /// Returns `None` for the same conditions as
+  /// [`Self::token_to_str`] (out-of-range or sparse-vocab miss).
+  ///
+  /// **NUL-byte caveat.** The underlying C accessor returns a
+  /// NUL-terminated `c_str`; if a token's vocab entry happens
+  /// to contain an interior NUL byte the returned slice is
+  /// truncated at that NUL. The standard whisper checkpoints
+  /// don't produce vocab entries with interior NULs, but
+  /// custom checkpoints theoretically could. If you need
+  /// guaranteed full-byte access, call this and verify the
+  /// expected length yourself, or upstream a length-aware
+  /// C accessor.
+  pub fn token_to_bytes(&self, token: i32) -> Option<&[u8]> {
+    let n = self.n_vocab();
+    if token < 0 || token >= n {
+      return None;
+    }
+    // SAFETY: token bound checked above; the patched
+    // `whisper_token_to_str` returns NULL on sparse-vocab
+    // miss, no throw.
+    let raw = unsafe { sys::whisper_token_to_str(self.ptr.as_ptr(), token) };
+    if raw.is_null() {
+      return None;
+    }
+    // SAFETY: NUL-terminated; lives as long as Context.
+    let bytes = unsafe { core::ffi::CStr::from_ptr(raw).to_bytes() };
+    Some(bytes)
+  }
+
+  // ── Special token ids (force-prefix decoding seeds) ────────
+
+  /// `<|translate|>` — task token that selects the translate
+  /// flow when prepended to the decoder prompt.
+  pub fn token_translate(&self) -> i32 {
+    // SAFETY: pure read of vocab table; no throw.
+    unsafe { sys::whisper_token_translate(self.ptr.as_ptr()) }
+  }
+
+  /// `<|transcribe|>` — task token that selects transcription
+  /// (the default).
+  pub fn token_transcribe(&self) -> i32 {
+    // SAFETY: pure read.
+    unsafe { sys::whisper_token_transcribe(self.ptr.as_ptr()) }
+  }
+
+  /// `<|prev|>` — start-of-prev marker, prepends a
+  /// previous-context prompt segment.
+  pub fn token_prev(&self) -> i32 {
+    // SAFETY: pure read.
+    unsafe { sys::whisper_token_prev(self.ptr.as_ptr()) }
+  }
+
+  /// `<|nospeech|>` — emitted when the model classifies the
+  /// audio as silence / non-speech.
+  pub fn token_nosp(&self) -> i32 {
+    // SAFETY: pure read.
+    unsafe { sys::whisper_token_nosp(self.ptr.as_ptr()) }
+  }
+
+  /// `<|notimestamps|>` — disables timestamp-token emission.
+  pub fn token_not(&self) -> i32 {
+    // SAFETY: pure read.
+    unsafe { sys::whisper_token_not(self.ptr.as_ptr()) }
+  }
+
+  /// `<|startoflm|>` — start-of-language-model marker (rare,
+  /// used by some prompt-engineering setups).
+  pub fn token_solm(&self) -> i32 {
+    // SAFETY: pure read.
+    unsafe { sys::whisper_token_solm(self.ptr.as_ptr()) }
+  }
+
+  /// Token id for a specific [`Lang`](crate::Lang) (the `<|en|>` / `<|zh|>`
+  /// language tokens whisper.cpp emits at the start of every
+  /// transcript).
+  ///
+  /// Returns `None` when:
+  /// * the model is not multilingual (English-only
+  ///   checkpoints have no language tokens at all);
+  /// * `lang` is `Lang::Other(...)` with a code whisper.cpp's
+  ///   global table doesn't recognise (`whisper_lang_id`
+  ///   returns -1);
+  /// * the language code contains an interior NUL byte;
+  /// * the resolved token falls outside the model's
+  ///   language-token range `(token_sot, token_translate)`.
+  ///   Whisper.cpp's `whisper_token_lang(ctx, lang_id)` is a
+  ///   bare `token_sot + 1 + lang_id` calculation with no
+  ///   bounds check; for a checkpoint with fewer language
+  ///   tokens than the global `g_lang` table has entries,
+  ///   the result can collide with `token_translate` /
+  ///   `token_transcribe` and silently corrupt the decoder
+  ///   prompt. We validate the range here and return
+  ///   `None` for out-of-range computations.
+  ///
+  /// Useful as input to [`Params::set_tokens`](crate::Params::set_tokens)
+  /// for callers who want to seed the decoder with an explicit
+  /// `<|lang|>` prefix instead of relying on auto-detect.
+  pub fn token_for_lang(&self, lang: &crate::Lang) -> Option<i32> {
+    if !self.is_multilingual() {
+      return None;
+    }
+    let lang_id = crate::lang_id_for(lang.as_str())?;
+    // SAFETY: pure read; ctx pointer invariant. Upstream's
+    // `whisper_token_lang` returns
+    // `vocab.token_sot + 1 + lang_id` — pure addition, no
+    // allocation, no `at()` lookup, no throw.
+    let token = unsafe { sys::whisper_token_lang(self.ptr.as_ptr(), lang_id) };
+    let sot = self.token_sot();
+    // SAFETY: ctx pointer invariant; pure vocab read.
+    let translate = unsafe { sys::whisper_token_translate(self.ptr.as_ptr()) };
+    if token > sot && token < translate {
+      Some(token)
+    } else {
+      // Resolved token landed on a task-token slot or
+      // further — model doesn't actually support this
+      // language even though the global table did.
+      None
+    }
+  }
+
+  // ── Tokenisation ───────────────────────────────────────────
+
+  /// Tokenise `text` into the model's vocabulary ids. Wraps
+  /// `whisper_tokenize` through the
+  /// `whispercpp_tokenize` exception-catching shim — upstream
+  /// can throw `std::bad_alloc` from the internal
+  /// `std::vector` / `std::string` builds, and a throw across
+  /// `extern "C"` is undefined behaviour without the shim.
+  ///
+  /// Returns `None` on:
+  /// * interior NUL byte in `text` (rejected at the safe-Rust
+  ///   boundary before any FFI / allocation);
+  /// * the fallible NUL-terminated copy fails (`try_reserve_exact`
+  ///   reports an allocator failure on attacker-sized inputs
+  ///   under memory pressure);
+  /// * shim caught a C++ exception during tokenisation
+  ///   (`std::bad_alloc` from the internal `std::vector` /
+  ///   `std::string` builds). The shim signals this via
+  ///   `INT_MIN` return; we surface it as `None`.
+  ///
+  /// **Sentinel discipline.** Upstream encodes
+  /// "buffer too small, need `-return` more tokens" in the
+  /// negative return domain — `whisper.cpp:4297`. The shim
+  /// reserves `INT_MIN` (and ONLY `INT_MIN`) for caught
+  /// exceptions so it cannot collide with any realistic
+  /// `-needed_count`. An earlier design used the
+  /// `WHISPERCPP_ERR_*` ladder at `-100..=-103`, which
+  /// silently failed on any input requiring exactly
+  /// 100..=103 tokens.
+  ///
+  /// Allocation cost: a single tokenise call against an
+  /// initial capacity (256 ids — comfortable for typical
+  /// segment-length inputs); on negative-return ("need more
+  /// tokens") we grow the buffer once and retry. So the
+  /// happy path is one upstream tokenisation; only inputs
+  /// exceeding the initial capacity pay for a second.
+  pub fn tokenize(&self, text: &str) -> Option<Vec<i32>> {
+    // Build a NUL-terminated byte buffer with FALLIBLE
+    // allocation. `CString::new(text)` would call
+    // `Vec::from(slice)` internally, which uses the
+    // infallible global allocator path and aborts the
+    // process on OOM. A safe-Rust caller passing a long
+    // attacker-controlled string under memory pressure
+    // shouldn't kill the process; surface OOM as `None`.
+    let bytes = text.as_bytes();
+    if bytes.contains(&0) {
+      return None;
+    }
+    let mut nul_terminated: Vec<u8> = Vec::new();
+    nul_terminated.try_reserve_exact(bytes.len() + 1).ok()?;
+    nul_terminated.extend_from_slice(bytes);
+    nul_terminated.push(0);
+    let cstr_ptr: *const core::ffi::c_char = nul_terminated.as_ptr().cast();
+
+    let ctx_ptr = self.ptr.as_ptr();
+
+    // Single-pass with retry. The previous round's design
+    // probed via `whispercpp_token_count` and then wrote
+    // via `whispercpp_tokenize` — TWO upstream
+    // `tokenize(vocab, text)` invocations per Rust call.
+    // The current `whispercpp-sys: no-log tokenize shim`
+    // patch makes `whispercpp_tokenize` itself no-log on
+    // too-small returns, so we can call it once with a
+    // generous initial capacity and retry only on
+    // negative-count: ONE upstream tokenization on the
+    // happy path, two only on retry.
+    //
+    // 256 covers most realistic inputs (whisper segments
+    // typically tokenize to 50–150 tokens; longer texts
+    // up to the 448-token text-context). If the input
+    // exceeds it, we pay the retry cost — same as the
+    // previous probe-and-write design.
+    const INITIAL_CAPACITY: usize = 256;
+    let mut buf: Vec<i32> = Vec::new();
+    buf.try_reserve_exact(INITIAL_CAPACITY).ok()?;
+
+    // SAFETY: buf has capacity ≥ INITIAL_CAPACITY; nul_terminated
+    // outlives the call; ctx_ptr is non-null.
+    let written = unsafe {
+      sys::whispercpp_tokenize(ctx_ptr, cstr_ptr, buf.as_mut_ptr(), INITIAL_CAPACITY as i32)
+    };
+    if written == i32::MIN {
+      return None;
+    }
+    if written >= 0 {
+      // Happy path — input fit in INITIAL_CAPACITY.
+      let written_usize = written as usize;
+      if written_usize > buf.capacity() {
+        return None;
+      }
+      // SAFETY: upstream wrote `written_usize` `i32`s.
+      unsafe { buf.set_len(written_usize) };
+      return Some(buf);
+    }
+    // Negative non-`INT_MIN` → upstream's
+    // `-(needed_count)` for "buffer too small". Allocate
+    // the right size and retry.
+    let needed = (-written) as usize;
+    let mut buf: Vec<i32> = Vec::new();
+    buf.try_reserve_exact(needed).ok()?;
+    // SAFETY: buf.as_mut_ptr() valid for `needed` writes;
+    // nul_terminated still alive.
+    let written =
+      unsafe { sys::whispercpp_tokenize(ctx_ptr, cstr_ptr, buf.as_mut_ptr(), needed as i32) };
+    if written == i32::MIN {
+      return None;
+    }
+    if written < 0 {
+      // Defensive: shouldn't happen at exact capacity.
+      return None;
+    }
+    let written_usize = written as usize;
+    if written_usize > buf.capacity() {
+      return None;
+    }
+    // SAFETY: upstream wrote `written_usize` `i32`s.
+    unsafe { buf.set_len(written_usize) };
+    Some(buf)
+  }
+
+  /// Tokenise `text` and return the single resulting token id,
+  /// or `None` if the text doesn't tokenise to exactly one token.
+  ///
+  /// Useful for converting short literal markers (`"<|en|>"`,
+  /// `" Hello"`) into ids without round-tripping through a
+  /// `Vec<i32>`.
+  ///
+  /// Direct single-pass call with a stack output buffer:
+  /// avoids the heap allocation `tokenize` would do for the
+  /// `Vec<i32>` we'd then immediately discard. The input
+  /// NUL-terminated buffer is still heap-allocated
+  /// (text length is unbounded), but the output buffer is
+  /// 4 bytes on the stack.
+  pub fn tokenize_one(&self, text: &str) -> Option<i32> {
+    let bytes = text.as_bytes();
+    if bytes.contains(&0) {
+      return None;
+    }
+    let mut nul_terminated: Vec<u8> = Vec::new();
+    nul_terminated.try_reserve_exact(bytes.len() + 1).ok()?;
+    nul_terminated.extend_from_slice(bytes);
+    nul_terminated.push(0);
+    let cstr_ptr: *const core::ffi::c_char = nul_terminated.as_ptr().cast();
+    let ctx_ptr = self.ptr.as_ptr();
+
+    // Stack-only output buffer for the single token id.
+    // Asking for capacity 1 means upstream returns:
+    //   * `1` if `text` tokenised to exactly one token
+    //     (success — `out[0]` holds the id);
+    //   * `0` if `text` was empty / yielded zero tokens
+    //     (fail — return `None`);
+    //   * `-(needed)` if `text` would tokenise to >1 tokens
+    //     (fail — `tokenize_one`'s contract);
+    //   * `INT_MIN` on caught C++ exception.
+    let mut out = [0i32; 1];
+    // SAFETY: nul_terminated outlives the call; out has 1
+    // element of capacity; ctx_ptr is non-null.
+    let written = unsafe { sys::whispercpp_tokenize(ctx_ptr, cstr_ptr, out.as_mut_ptr(), 1) };
+    if written == 1 { Some(out[0]) } else { None }
+  }
+
+  // ── Model introspection ────────────────────────────────────
+
+  /// Snapshot of the loaded model's hyper-parameters. Wraps
+  /// the per-field `whisper_model_n_*` accessors.
+  pub fn model_dims(&self) -> ModelDims {
+    let p = self.ptr.as_ptr();
+    // SAFETY: ctx pointer invariant. Each accessor reads a
+    // const field of the loaded model's hparams struct; no
+    // allocations, no throw.
+    unsafe {
+      ModelDims {
+        n_audio_state: sys::whisper_model_n_audio_state(p),
+        n_audio_head: sys::whisper_model_n_audio_head(p),
+        n_audio_layer: sys::whisper_model_n_audio_layer(p),
+        n_text_state: sys::whisper_model_n_text_state(p),
+        n_text_head: sys::whisper_model_n_text_head(p),
+        n_text_layer: sys::whisper_model_n_text_layer(p),
+        n_mels: sys::whisper_model_n_mels(p),
+        model_ftype: sys::whisper_model_ftype(p),
+      }
+    }
+  }
+
+  // Timing helpers live on `State`, not `Context`. Upstream's
+  // `whisper_print_timings(ctx)` / `whisper_reset_timings(ctx)`
+  // only operate on `ctx->state`, which is always nullptr in
+  // this wrapper because `Context::new` uses the `_no_state`
+  // initializer. The state-aware
+  // `whispercpp_*_timings_with_state` shims (in the patched
+  // `whisper.cpp`) accept the actual State the wrapper hands
+  // out; see `State::print_timings` /
+  // `State::reset_timings`.
+}
+
+/// Loaded-model hyper-parameter snapshot returned by
+/// [`Context::model_dims`].
+///
+/// All fields are passthroughs from the C-side
+/// `whisper_model_n_*` accessors. None of them are validated
+/// here beyond the bounds whisper.cpp's own loader applies
+/// (see the `whispercpp-sys: hparams validation` patch in the
+/// linked submodule for what's enforced at load time).
+///
+/// Mostly useful for diagnostics / format-detection code that
+/// wants to know which checkpoint variant got loaded
+/// (e.g. distinguishing `large-v3` from `large-v3-turbo` by
+/// `n_text_layer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModelDims {
+  /// Encoder hidden size.
+  pub n_audio_state: i32,
+  /// Encoder attention heads per layer.
+  pub n_audio_head: i32,
+  /// Encoder layers.
+  pub n_audio_layer: i32,
+  /// Decoder hidden size.
+  pub n_text_state: i32,
+  /// Decoder attention heads per layer.
+  pub n_text_head: i32,
+  /// Decoder layers.
+  pub n_text_layer: i32,
+  /// Mel-spectrogram bin count (80 for vanilla checkpoints,
+  /// 128 for `large-v3+`).
+  pub n_mels: i32,
+  /// File-type tag baked into the GGUF header (quantisation
+  /// flavour, etc.). Raw integer; consult whisper.cpp's
+  /// `e_ftype` enum for the meaning.
+  pub model_ftype: i32,
 }
 
 /// System-info string assembled by libwhisper — backend caps
