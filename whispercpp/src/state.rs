@@ -1306,6 +1306,14 @@ mod tests {
     // forgotten Arc keeps the count at 1 forever — so
     // `Arc::drop` never reaches refcount 0 and
     // `Context::drop` never runs.
+    //
+    // Miri note: every call to this helper leaks one
+    // `ArcInner` (40 bytes) by design — Miri's default
+    // leak checker correctly flags it. Tests that drive
+    // this fixture are tagged `#[cfg_attr(miri, ignore =
+    // "...")]` so Miri skips them; pure compile-time
+    // tests (PhantomData / trait-bound assertions) stay
+    // covered.
     let ctx = Arc::new(unsafe { Context::dangling_for_test() });
     let state = State::poisoned_for_test(Arc::clone(&ctx));
     core::mem::forget(ctx);
@@ -1324,6 +1332,7 @@ mod tests {
   /// the base case the iterator MUST handle: a state whose
   /// `n_segments()` returned `0`. Anything that yields a
   /// nonzero count or panics on this input is broken.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn segments_iter_empty_state_yields_zero_items() {
     let state = poisoned_state_for_test();
@@ -1335,6 +1344,7 @@ mod tests {
   /// Iterator length agrees with `n_segments()`. Pins the
   /// contract that a future refactor of either side (e.g.
   /// caching the count differently) can't desynchronise.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn segments_iter_count_matches_n_segments() {
     let state = poisoned_state_for_test();
@@ -1350,6 +1360,7 @@ mod tests {
   /// `len()` impl is what `Vec::from_iter` uses to pre-
   /// allocate, so a wrong `len()` would either over-allocate
   /// or panic.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn segments_iter_exact_size_len_matches_count() {
     let state = poisoned_state_for_test();
@@ -1365,6 +1376,7 @@ mod tests {
   /// segment count is known up-front and never changes
   /// mid-iteration. Pins the lower bound + upper bound so
   /// adapters like `Vec::extend` can pre-allocate optimally.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn segments_iter_size_hint_is_exact() {
     let state = poisoned_state_for_test();
@@ -1379,6 +1391,7 @@ mod tests {
   /// keep returning `None` rather than producing items
   /// again. The `fuse()`-free explicit impl on `Segments`
   /// promises this — pin it.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn segments_iter_fused_after_exhaustion() {
     let state = poisoned_state_for_test();
@@ -1395,6 +1408,7 @@ mod tests {
   /// fine). The iterator only mutates its own index counter,
   /// not any shared state, so this exercises the
   /// "concurrent reads safe" claim from the doc comment.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn multiple_segments_iter_alive_concurrently() {
     let state = poisoned_state_for_test();
@@ -1411,6 +1425,7 @@ mod tests {
   /// standard library's adapter chain — a common breakage
   /// when iterator types accidentally pick up unintended
   /// trait bounds.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn segments_iter_composes_with_adapters() {
     let state = poisoned_state_for_test();
@@ -1429,6 +1444,7 @@ mod tests {
   /// same reason. This test never executes the inner body
   /// on the poisoned fixture, but the body is still
   /// parsed and type-checked.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn nested_segments_and_tokens_iter_compiles() {
     let state = poisoned_state_for_test();
@@ -1451,6 +1467,7 @@ mod tests {
   /// requires the trait bound at the type-system level —
   /// a future change that broke either bound would fail
   /// to compile here.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn iterator_type_bounds_are_correct() {
     fn assert_iter<I: Iterator>(_: I) {}
@@ -1479,6 +1496,7 @@ mod tests {
   /// empty. The type-check is the load-bearing assertion;
   /// the runtime count is a defense-in-depth check that
   /// the iterator wires up correctly.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn tokens_iter_composes_with_flat_map() {
     let state = poisoned_state_for_test();
@@ -1503,6 +1521,7 @@ mod tests {
   /// fixture) so a future change can't quietly drop the
   /// impl. The compile-time check is the load-bearing
   /// assertion.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn into_iter_for_state_ref_yields_segments() {
     let state = poisoned_state_for_test();
@@ -1536,6 +1555,7 @@ mod tests {
   /// `.rev()` chains correctly. Empty fixture means the
   /// runtime check is "never yields"; the load-bearing
   /// assertion is the trait-bound on `.rev()`.
+  #[cfg_attr(miri, ignore = "intentional Arc leak in poisoned_state_for_test fixture")]
   #[test]
   fn segments_iter_double_ended_compiles_and_empty_yields_none() {
     let state = poisoned_state_for_test();
