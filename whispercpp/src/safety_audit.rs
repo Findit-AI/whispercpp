@@ -382,6 +382,59 @@
 //!    during inference). ✓
 //! 10. model-bound: state-bound (correct). ✓
 //!
+//! ### `segments_iter(&self)` / `Segment::tokens_iter(&self)`
+//! 1. throw: `Segments::next` and `Tokens::next` inline
+//!    the pointer-projection (private-field access on
+//!    `State.ptr` / `Segment.state`) instead of calling
+//!    back through `State::segment(i)` / `Segment::token(j)`,
+//!    which would re-call `n_segments()` / `n_tokens()`
+//!    (FFI) for their bounds check. The captured `end`
+//!    field plus the `&self` borrow chain make the
+//!    bounds-check redundant: `State::full` requires
+//!    `&mut self`, so the count cannot change while any
+//!    iterator borrow is alive. The inlined unsafe FFI
+//!    is `whisper_full_get_token_data_from_state` —
+//!    pure C accessor, no allocation, no throw. ✓
+//! 2. sync: `State` is `!Sync`. `&self` on the iterator
+//!    permits multiple iterators alive simultaneously,
+//!    which is sound because the underlying buffers are
+//!    immutable for the borrow's duration (`State::full`
+//!    requires `&mut self`, ruled out by the borrow
+//!    checker while any `&self` iterator exists). ✓
+//! 3. alloc: iterator state is two i32s + a borrow; no
+//!    Rust-side alloc. ✓
+//! 4. lifetime: `Segments<'a>` ties yielded `Segment<'a>`
+//!    to the source `&'a State`. `Tokens<'state>` owns a
+//!    copied `Segment<'state>` (which is `Copy`), so
+//!    adapter composition like
+//!    `state.segments_iter().flat_map(|s|
+//!    s.tokens_iter())` typechecks (the iterator does
+//!    not borrow a closure-local `Segment`). The
+//!    `'state` lifetime still ties yielded item pointer
+//!    projections to the parent `State`. Yielded `Token`
+//!    is value-typed (owned snapshot) so has no further
+//!    lifetime constraint. ✓
+//! 5. linkage: no new FFI symbols. ✓
+//! 6. sentinels: `next` and `end` index counters;
+//!    bounded at construction by `n_segments()` /
+//!    `n_tokens()`. `next_back` (DoubleEndedIterator)
+//!    decrements `end`; the `next < end` guard at the
+//!    top of every direction's call rejects the
+//!    converged-cursor case. ✓
+//! 7. log pollution: no log path. ✓
+//! 8. error bounds: iterator yields `Option<Item>`; no
+//!    error variant. ✓
+//! 9. race: `!Sync` rules out concurrent `&self` from
+//!    two threads. ✓
+//! 10. model-bound: yields whatever `State::full`
+//!     produced; bound to the loaded model implicitly via
+//!     the parent state. ✓
+//!
+//! `IntoIterator` impls (`for &State`, `for Segment`,
+//! `for &Segment`) delegate to the existing
+//! `segments_iter` / `tokens_iter` constructors, so they
+//! inherit the same axis coverage — no separate row.
+//!
 //! ### `full(&mut self, ...)`
 //! Pre-existing FFI surface; the audit here is on the
 //! preflight additions:
