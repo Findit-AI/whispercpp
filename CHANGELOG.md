@@ -7,8 +7,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [0.2.1] - 2026-05-09
 
-Additive release. Cargo-compatible with `whispercpp = "0.2"` consumers; no
-changes to `whispercpp-sys` (the `-sys` crate stays at `0.2.0`).
+Closes [#3] (delivered via PR [#9]). Additive release: cargo-compatible
+with `whispercpp = "0.2"` consumers; no changes to `whispercpp-sys` (the
+`-sys` crate stays at `0.2.0`).
 
 ### Added
 
@@ -37,11 +38,12 @@ changes to `whispercpp-sys` (the `-sys` crate stays at `0.2.0`).
 
 ### Internal
 
-- New `#[cfg(test)] pub(crate)` test fixtures in `context.rs` /
-  `state.rs` (`Context::dangling_for_test` `unsafe fn`,
-  `State::poisoned_for_test`) so iterator behaviour can be exercised
-  without a real model file. The `unsafe fn` makes the
-  "caller must `mem::forget`" precondition explicit at every call site.
+- New test fixture (`PoisonedStateFixture`) and `Context::dangling_for_test`
+  (`unsafe fn`) so iterator behaviour can be exercised without a real model
+  file. The fixture's RAII guard holds a `ManuallyDrop<Arc<Context>>` clone
+  alongside the State, keeping the `Context` refcount permanently above
+  zero so `whisper_free` is never called on the dangling pointer — the
+  invariant is destructor-managed and survives test panics.
 - `safety_audit.rs` matrix gains a `segments_iter` / `tokens_iter` row
   walking all ten safety axes; inlined-FFI projection rationale documented
   under axis #1 (throw).
@@ -50,6 +52,7 @@ changes to `whispercpp-sys` (the `-sys` crate stays at `0.2.0`).
 
 No bug fixes — this is a feature-only release.
 
+[#3]: https://github.com/Findit-AI/whispercpp/issues/3
 [#9]: https://github.com/Findit-AI/whispercpp/pull/9
 
 ## [0.2.0] - 2026-05-09

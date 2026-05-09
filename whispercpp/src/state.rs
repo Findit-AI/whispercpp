@@ -91,21 +91,6 @@ impl State {
     }
   }
 
-  /// Internal test-only constructor. Builds a `State` already
-  /// in the "poisoned" mode (`ptr: None`, see
-  /// [`State::is_poisoned`]) so accessors short-circuit to
-  /// safe defaults (`n_segments() == 0`, `segment(_)` →
-  /// `None`). Used by unit tests to exercise Rust-side
-  /// iterator logic without spinning up a real
-  /// `whisper_state`. The associated `Arc<Context>` should be
-  /// a `Context::dangling_for_test`; callers must
-  /// `core::mem::forget` the unwrapped Arc so the dangling
-  /// `whisper_context*` never reaches `whisper_free`.
-  #[cfg(test)]
-  pub(crate) fn poisoned_for_test(ctx: Arc<Context>) -> Self {
-    Self { ptr: None, ctx }
-  }
-
   /// Borrow the parent context. Useful when calling sites need
   /// the same Arc to construct sibling state objects.
   pub fn context(&self) -> &Arc<Context> {
@@ -1351,8 +1336,26 @@ mod tests {
       // the contained Arc's decrement on `Drop` (this
       // fixture's destructor inherits ManuallyDrop's no-op
       // behaviour for that field).
+      //
+      // The `State { ptr: None, ctx }` literal accesses
+      // `State`'s private fields directly — possible
+      // because `mod tests` is a child of state.rs and
+      // inherits the parent module's privacy boundary.
+      // Inlining here (instead of a free
+      // `State::poisoned_for_test` constructor) keeps the
+      // soundness chain — "the Arc<Context> derived from
+      // an unsafe `dangling_for_test` is consumed by a
+      // safe State constructor" — collapsed into one
+      // auditable point. Per PR #9 review feedback: a
+      // crate-visible safe `poisoned_for_test(arc)` would
+      // propagate the unsafe Arc-leak contract into a
+      // safe API, which is exactly the soundness hole
+      // the reviewer flagged.
       let ctx = Arc::new(unsafe { Context::dangling_for_test() });
-      let state = State::poisoned_for_test(Arc::clone(&ctx));
+      let state = State {
+        ptr: None,
+        ctx: Arc::clone(&ctx),
+      };
       Self {
         state,
         _leaked_ctx: core::mem::ManuallyDrop::new(ctx),
